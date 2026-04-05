@@ -36,3 +36,8 @@ Thumbs.db
 
 # Misc
 *.log
+
+# Local docs and drafts
+*.draft.*
+docs/private/
+notes/
