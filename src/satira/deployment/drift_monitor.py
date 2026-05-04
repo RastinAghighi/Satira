@@ -126,15 +126,16 @@ class EmbeddingDriftMonitor:
 
         # 3) Structural — energy redistribution across principal axes.
         structural_drift = _structural_shift(stacked, train_sv)
+        structural_norm = min(1.0, structural_drift)
 
         composite = (
             self.MARGINAL_W * marginal_norm
             + self.NORM_W * norm_norm
-            + self.STRUCT_W * structural_drift
+            + self.STRUCT_W * structural_norm
         )
 
         status, recommendation = self._classify(
-            composite, marginal_norm, norm_norm, structural_drift
+            composite, marginal_norm, norm_norm, structural_norm
         )
 
         return DriftReport(
@@ -198,11 +199,12 @@ def _copy_stats(stats: dict) -> dict:
 def _structural_shift(stacked: torch.Tensor, train_sv: torch.Tensor) -> float:
     """Relative L2 distance between the top training and current SV spectra.
 
-    Returns 0 when the spectra match and saturates at 1 once the
-    difference matches the magnitude of the training spectrum itself.
-    Singular values alone are rotation-invariant, so this catches
-    energy redistribution (rank collapse, scale shifts, low-rank drift)
-    rather than pure rotations of the principal axes.
+    Returns 0 when the spectra match. The raw value is unbounded above —
+    callers saturate for the composite score; the report surfaces the
+    raw magnitude so operators can tell "barely drifted" from
+    "completely different shape." Singular values alone are
+    rotation-invariant, so this catches energy redistribution (rank
+    collapse, scale shifts, low-rank drift) rather than pure rotations.
     """
     if train_sv.numel() == 0:
         return 0.0
@@ -220,8 +222,7 @@ def _structural_shift(stacked: torch.Tensor, train_sv: torch.Tensor) -> float:
     a_norm = float(a.norm().item())
     if a_norm <= _EPS:
         return 0.0 if float(b.norm().item()) <= _EPS else 1.0
-    rel = float((a - b).norm().item() / a_norm)
-    return min(1.0, rel)
+    return float((a - b).norm().item() / a_norm)
 
 
 def _dominant_component(marginal: float, norm: float, structural: float) -> str:
