@@ -1,13 +1,60 @@
 services:
-  api:
-    build: .
+  inference:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.inference
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      SATIRA_REDIS_URL: redis://redis:6379
+      SATIRA_DATABASE_URL: postgresql://satira:satira@postgres:5432/satira
+    depends_on:
+      - redis
+      - postgres
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  resolver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.resolver
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      SATIRA_REDIS_URL: redis://redis:6379
+      SATIRA_DATABASE_URL: postgresql://satira:satira@postgres:5432/satira
+    depends_on:
+      - redis
+
+  offline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.offline
+    env_file:
+      - .env
+    environment:
+      SATIRA_REDIS_URL: redis://redis:6379
+      SATIRA_DATABASE_URL: postgresql://satira:satira@postgres:5432/satira
     depends_on:
       - redis
       - postgres
+    profiles: ["offline"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   redis:
     image: redis:7-alpine
