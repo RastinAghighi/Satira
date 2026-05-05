@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: context-resolver
+  labels:
+    app: context-resolver
+spec:
+  type: ClusterIP
+  selector:
+    app: context-resolver
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: context-resolver
+  labels:
+    app: context-resolver
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: context-resolver
+  template:
+    metadata:
+      labels:
+        app: context-resolver
+    spec:
+      nodeSelector:
+        instance-type: m6i.2xlarge
+      containers:
+        - name: context-resolver
+          image: satira/resolver:latest
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 12Gi
+          volumeMounts:
+            - name: faiss-index
+              mountPath: /var/lib/satira/faiss-index
+              readOnly: true
+            - name: graph-embeddings
+              mountPath: /var/lib/satira/graph-embeddings
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            periodSeconds: 10
+      volumes:
+        - name: faiss-index
+          persistentVolumeClaim:
+            claimName: faiss-index
+            readOnly: true
+        - name: graph-embeddings
+          persistentVolumeClaim:
+            claimName: graph-embeddings
+            readOnly: true
