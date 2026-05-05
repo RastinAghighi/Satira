@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: graph-embedding-refresh
+  labels:
+    app: graph-embedding-refresh
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: graph-embedding-refresh
+        spec:
+          restartPolicy: OnFailure
+          nodeSelector:
+            capacity-type: spot
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+            - key: capacity-type
+              operator: Equal
+              value: spot
+              effect: NoSchedule
+          containers:
+            - name: graph-embedding-refresh
+              image: satira/offline:latest
+              envFrom:
+                - configMapRef:
+                    name: satira-config
+              resources:
+                requests:
+                  cpu: "8"
+                  memory: 16Gi
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "8"
+                  memory: 16Gi
+                  nvidia.com/gpu: "1"

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: satira-config
+data:
+  REDIS_URL: redis://redis:6379/0
+  DATABASE_URL: postgresql://satira:satira@postgres:5432/satira
+  S3_BUCKET: satira-artifacts
+  MLFLOW_URI: http://mlflow:5000

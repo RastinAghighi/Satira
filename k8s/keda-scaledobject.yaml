@@ -1,0 +1,20 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: inference-worker
+  labels:
+    app: inference-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-worker
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  cooldownPeriod: 300
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: inference-queue
+        listLength: "50"
