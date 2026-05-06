@@ -361,13 +361,13 @@ async def test_gdelt_falls_back_to_url_netloc_when_domain_missing() -> None:
 
 # --- RSS news tests ---------------------------------------------------------
 async def test_rss_news_yields_items_with_authentic_label() -> None:
-    feeds = {"reuters_world": "https://feeds.reuters.com/reuters/worldNews"}
+    feeds = {"bbc_news": "http://feeds.bbci.co.uk/news/rss.xml"}
     scraper = _make_rss(feeds=feeds)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/robots.txt":
             return _empty_robots()
-        if str(request.url) == feeds["reuters_world"]:
+        if str(request.url) == feeds["bbc_news"]:
             return _rss_response()
         raise AssertionError(f"unexpected url: {request.url}")
 
@@ -381,9 +381,9 @@ async def test_rss_news_yields_items_with_authentic_label() -> None:
     for item in items:
         assert item.metadata["label"] == "authentic"
         assert item.metadata["source_type"] == "rss"
-        assert item.metadata["outlet"] == "Reuters"
-        assert item.metadata["feed_key"] == "reuters_world"
-        assert item.source_domain == "reuters.com"
+        assert item.metadata["outlet"] == "BBC"
+        assert item.metadata["feed_key"] == "bbc_news"
+        assert item.source_domain == "bbc.co.uk"
 
 
 async def test_rss_news_feed_keys_filters_feeds() -> None:
@@ -482,11 +482,12 @@ async def test_rss_news_default_feeds_cover_known_outlets() -> None:
     finally:
         await scraper.close()
     assert keys == {
-        "reuters_world",
         "bbc_news",
         "ap_top",
         "npr_news",
         "guardian_world",
+        "nyt_world",
+        "aljazeera_all",
     }
 
 

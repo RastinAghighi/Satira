@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urljoin
 
 import feedparser
 
@@ -32,19 +33,43 @@ from satira.ingest.base_scraper import BaseScraper, ScrapedItem
 logger = logging.getLogger(__name__)
 
 
-_IMG_TAG_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+_OG_IMAGE_PROP_FIRST = re.compile(
+    r'<meta\b[^>]*?\b(?:property|name)\s*=\s*["\']og:image(?::url)?["\']'
+    r'[^>]*?\bcontent\s*=\s*["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+_OG_IMAGE_CONTENT_FIRST = re.compile(
+    r'<meta\b[^>]*?\bcontent\s*=\s*["\']([^"\']+)["\']'
+    r'[^>]*?\b(?:property|name)\s*=\s*["\']og:image(?::url)?["\']',
+    re.IGNORECASE,
+)
 
-def _extract_image_url(entry: Any) -> str | None:
+
+HtmlFetcher = Callable[[str], Awaitable[str | None]]
+
+
+async def _extract_image_url(
+    entry: Any,
+    *,
+    fetcher: HtmlFetcher | None = None,
+) -> str | None:
     """Pull a featured image URL from an RSS entry, trying common locations.
 
-    RSS feeds carry images in several places depending on the publisher:
-    ``<media:thumbnail>``, ``<media:content>``, ``<enclosure>``, or
-    embedded ``<img>`` tags inside the description. We try them in
-    rough order of how likely they are to point at the canonical hero
-    image.
+    Order: ``enclosure`` → ``media:thumbnail`` → ``media:content`` →
+    ``og:image`` from the article page. The article-page fetch is only
+    used when the structured locations all came up empty, since pulling
+    full HTML for every entry would gut the throughput of an otherwise
+    feed-only scrape.
     """
+    enclosures = getattr(entry, "enclosures", None) or []
+    for enc in enclosures:
+        etype = (enc.get("type") or "").lower()
+        href = enc.get("href") or enc.get("url")
+        if href and (etype.startswith("image/") or not etype):
+            return href
+
     media_thumb = getattr(entry, "media_thumbnail", None)
     if media_thumb:
         url = media_thumb[0].get("url")
@@ -53,28 +78,40 @@ def _extract_image_url(entry: Any) -> str | None:
 
     media_content = getattr(entry, "media_content", None)
     if media_content:
-        url = media_content[0].get("url")
-        if url:
-            return url
+        for mc in media_content:
+            url = mc.get("url")
+            mtype = (mc.get("type") or "").lower()
+            medium = (mc.get("medium") or "").lower()
+            if url and (
+                mtype.startswith("image/") or medium == "image" or not mtype
+            ):
+                return url
 
-    enclosures = getattr(entry, "enclosures", None) or []
-    for enc in enclosures:
-        etype = (enc.get("type") or "").lower()
-        href = enc.get("href") or enc.get("url")
-        if href and (etype.startswith("image/") or not etype):
-            return href
+    if fetcher is not None:
+        link = (getattr(entry, "link", "") or "").strip()
+        if link:
+            og = await _extract_og_image(link, fetcher)
+            if og:
+                return og
 
-    content_blocks = getattr(entry, "content", None) or []
-    for block in content_blocks:
-        match = _IMG_TAG_RE.search(block.get("value", "") or "")
+    return None
+
+
+async def _extract_og_image(article_url: str, fetcher: HtmlFetcher) -> str | None:
+    """Best-effort fetch of the article page to pull ``og:image``."""
+    try:
+        html = await fetcher(article_url)
+    except Exception as exc:  # noqa: BLE001 — opportunistic fallback
+        logger.debug("og:image fetch failed for %s: %s", article_url, exc)
+        return None
+    if not html:
+        return None
+    for pattern in (_OG_IMAGE_PROP_FIRST, _OG_IMAGE_CONTENT_FIRST):
+        match = pattern.search(html)
         if match:
-            return match.group(1)
-
-    summary = getattr(entry, "summary", "") or ""
-    match = _IMG_TAG_RE.search(summary)
-    if match:
-        return match.group(1)
-
+            url = match.group(1).strip()
+            if url:
+                return urljoin(article_url, url)
     return None
 
 
@@ -142,13 +179,13 @@ class _RSSSatireScraper(BaseScraper):
             return
 
         for entry in feed.entries[:max_items]:
-            item = self._entry_to_item(entry)
+            item = await self._entry_to_item(entry)
             if item is None:
                 continue
             self.stats.items_yielded += 1
             yield item
 
-    def _entry_to_item(self, entry: Any) -> ScrapedItem | None:
+    async def _entry_to_item(self, entry: Any) -> ScrapedItem | None:
         url = getattr(entry, "link", "") or ""
         title = (getattr(entry, "title", "") or "").strip()
 
@@ -159,10 +196,11 @@ class _RSSSatireScraper(BaseScraper):
 
         summary_raw = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
         text = _strip_html(summary_raw)
+        image_url = await _extract_image_url(entry, fetcher=self.fetch)
 
         return ScrapedItem(
             source_url=url,
-            image_url=_extract_image_url(entry),
+            image_url=image_url,
             title=title,
             text=text,
             timestamp=_extract_timestamp(entry),

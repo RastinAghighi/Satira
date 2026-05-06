@@ -48,12 +48,17 @@ class ProcessedItem(ScrapedItem):
 
     ``kw_only=True`` lets us add required fields after the parent's
     optional ``metadata`` field without violating dataclass ordering.
+
+    The image fields are optional so the same record type can carry
+    text-only items (when the scraper couldn't find any image for the
+    article) — downstream stages branch on ``image_path is None``
+    rather than juggling two parallel record types.
     """
 
-    image_path: str
-    image_dimensions: tuple[int, int]
-    perceptual_hash: str
-    file_size_bytes: int
+    image_path: str | None = None
+    image_dimensions: tuple[int, int] | None = None
+    perceptual_hash: str | None = None
+    file_size_bytes: int = 0
 
 
 class _DefaultImageFetcher(BaseScraper):
@@ -199,6 +204,12 @@ class ImageDownloader:
         kept: list[ProcessedItem] = []
         kept_hashes: list[imagehash.ImageHash] = []
         for item in items:
+            # Text-only items have no perceptual hash to compare on, so
+            # they bypass image dedupe entirely. (URL/text-level dedupe
+            # is the caller's job if they care.)
+            if not item.perceptual_hash:
+                kept.append(item)
+                continue
             try:
                 ih = imagehash.hex_to_hash(item.perceptual_hash)
             except ValueError:

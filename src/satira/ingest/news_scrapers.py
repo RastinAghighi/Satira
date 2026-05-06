@@ -9,7 +9,8 @@ Two flavours live here. :class:`GDELTScraper` queries the public
 GDELT 2.0 DOC API — free, machine-readable, and uniform per record,
 which means we never have to scrape article HTML. :class:`RSSNewsScraper`
 is a generic ``feedparser`` wrapper pre-configured for major outlets
-(Reuters, BBC, AP, NPR, Guardian); it mirrors the satire RSS scrapers
+(BBC, AP, NPR, Guardian, NYT, Al Jazeera); it mirrors the satire RSS
+scrapers
 so the test scaffolding and quirks (image extraction, bozo-feed
 handling, …) carry over almost verbatim.
 
@@ -22,10 +23,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import feedparser
 
@@ -37,16 +38,45 @@ logger = logging.getLogger(__name__)
 
 _GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 
-_IMG_TAG_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+# og:image can have property/name and content in either order. Match
+# both orderings rather than a single permissive pattern that would also
+# match unrelated <meta> tags between attributes.
+_OG_IMAGE_PROP_FIRST = re.compile(
+    r'<meta\b[^>]*?\b(?:property|name)\s*=\s*["\']og:image(?::url)?["\']'
+    r'[^>]*?\bcontent\s*=\s*["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+_OG_IMAGE_CONTENT_FIRST = re.compile(
+    r'<meta\b[^>]*?\bcontent\s*=\s*["\']([^"\']+)["\']'
+    r'[^>]*?\b(?:property|name)\s*=\s*["\']og:image(?::url)?["\']',
+    re.IGNORECASE,
+)
 
-def _extract_image_url(entry: Any) -> str | None:
+
+HtmlFetcher = Callable[[str], Awaitable[str | None]]
+
+
+async def _extract_image_url(
+    entry: Any,
+    *,
+    fetcher: HtmlFetcher | None = None,
+) -> str | None:
     """Pull a featured image URL from an RSS entry, trying common locations.
 
-    Same precedence as the satire scrapers: ``media:thumbnail`` →
-    ``media:content`` → ``enclosure`` → embedded ``<img>`` in the body.
+    Order: ``enclosure`` → ``media:thumbnail`` → ``media:content`` →
+    ``og:image`` from the article page (only if ``fetcher`` is provided
+    and the structured locations all came up empty — fetching every
+    article HTML just for an image would otherwise gut throughput).
     """
+    enclosures = getattr(entry, "enclosures", None) or []
+    for enc in enclosures:
+        etype = (enc.get("type") or "").lower()
+        href = enc.get("href") or enc.get("url")
+        if href and (etype.startswith("image/") or not etype):
+            return href
+
     media_thumb = getattr(entry, "media_thumbnail", None)
     if media_thumb:
         url = media_thumb[0].get("url")
@@ -55,28 +85,46 @@ def _extract_image_url(entry: Any) -> str | None:
 
     media_content = getattr(entry, "media_content", None)
     if media_content:
-        url = media_content[0].get("url")
-        if url:
-            return url
+        for mc in media_content:
+            url = mc.get("url")
+            mtype = (mc.get("type") or "").lower()
+            medium = (mc.get("medium") or "").lower()
+            if url and (
+                mtype.startswith("image/") or medium == "image" or not mtype
+            ):
+                return url
 
-    enclosures = getattr(entry, "enclosures", None) or []
-    for enc in enclosures:
-        etype = (enc.get("type") or "").lower()
-        href = enc.get("href") or enc.get("url")
-        if href and (etype.startswith("image/") or not etype):
-            return href
+    if fetcher is not None:
+        link = (getattr(entry, "link", "") or "").strip()
+        if link:
+            og = await _extract_og_image(link, fetcher)
+            if og:
+                return og
 
-    content_blocks = getattr(entry, "content", None) or []
-    for block in content_blocks:
-        match = _IMG_TAG_RE.search(block.get("value", "") or "")
+    return None
+
+
+async def _extract_og_image(article_url: str, fetcher: HtmlFetcher) -> str | None:
+    """Best-effort fetch of the article page and pull of its ``og:image``.
+
+    Failures are silent: this is a fallback, and the caller will simply
+    end up with a text-only item if nothing comes back.
+    """
+    try:
+        html = await fetcher(article_url)
+    except Exception as exc:  # noqa: BLE001 — opportunistic fallback
+        logger.debug("og:image fetch failed for %s: %s", article_url, exc)
+        return None
+    if not html:
+        return None
+    for pattern in (_OG_IMAGE_PROP_FIRST, _OG_IMAGE_CONTENT_FIRST):
+        match = pattern.search(html)
         if match:
-            return match.group(1)
-
-    summary = getattr(entry, "summary", "") or ""
-    match = _IMG_TAG_RE.search(summary)
-    if match:
-        return match.group(1)
-
+            url = match.group(1).strip()
+            if url:
+                # og:image may be a relative URL; resolve against the
+                # article URL so downstream fetches don't 404.
+                return urljoin(article_url, url)
     return None
 
 
@@ -253,27 +301,33 @@ class GDELTScraper(BaseScraper):
 class RSSNewsScraper(BaseScraper):
     """Generic RSS scraper pre-wired for major news outlets.
 
-    The default feed list covers Reuters, BBC, AP, NPR, and the
-    Guardian — between them we get broad coverage with stable feeds
-    that don't change shape monthly. Per-feed metadata (outlet display
-    name and canonical domain) is stamped on each item so downstream
-    code can score credibility without re-parsing the URL.
+    The default feed list covers BBC, AP, NPR, the Guardian, the New
+    York Times, and Al Jazeera — between them we get broad coverage
+    with stable feeds that don't change shape monthly. Per-feed
+    metadata (outlet display name and canonical domain) is stamped on
+    each item so downstream code can score credibility without
+    re-parsing the URL.
+
+    Reuters' public RSS endpoints were retired and now return zero
+    entries; NYT World and Al Jazeera fill the same global-news slot.
     """
 
     DEFAULT_FEEDS: dict[str, str] = {
-        "reuters_world": "https://feeds.reuters.com/reuters/worldNews",
         "bbc_news": "http://feeds.bbci.co.uk/news/rss.xml",
         "ap_top": "https://feeds.apnews.com/rss/apf-topnews",
         "npr_news": "https://feeds.npr.org/1001/rss.xml",
         "guardian_world": "https://www.theguardian.com/world/rss",
+        "nyt_world": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "aljazeera_all": "https://www.aljazeera.com/xml/rss/all.xml",
     }
 
     DEFAULT_OUTLETS: dict[str, tuple[str, str]] = {
-        "reuters_world": ("Reuters", "reuters.com"),
         "bbc_news": ("BBC", "bbc.co.uk"),
         "ap_top": ("Associated Press", "apnews.com"),
         "npr_news": ("NPR", "npr.org"),
         "guardian_world": ("The Guardian", "theguardian.com"),
+        "nyt_world": ("The New York Times", "nytimes.com"),
+        "aljazeera_all": ("Al Jazeera", "aljazeera.com"),
     }
 
     def __init__(
@@ -329,7 +383,7 @@ class RSSNewsScraper(BaseScraper):
                 continue
 
             for entry in feed.entries[:max_per_feed]:
-                item = self._entry_to_item(
+                item = await self._entry_to_item(
                     entry,
                     feed_key=key,
                     outlet_name=outlet_name,
@@ -341,7 +395,7 @@ class RSSNewsScraper(BaseScraper):
                 self.stats.items_yielded += 1
                 yield item
 
-    def _entry_to_item(
+    async def _entry_to_item(
         self,
         entry: Any,
         *,
@@ -359,9 +413,10 @@ class RSSNewsScraper(BaseScraper):
             or getattr(entry, "description", "")
             or ""
         )
+        image_url = await _extract_image_url(entry, fetcher=self.fetch)
         return ScrapedItem(
             source_url=url,
-            image_url=_extract_image_url(entry),
+            image_url=image_url,
             title=title,
             text=_strip_html(summary_raw),
             timestamp=_extract_timestamp(entry),

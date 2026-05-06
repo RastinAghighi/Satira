@@ -61,21 +61,27 @@ MINIMAL_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 </rss>
 """
 
-EMBEDDED_IMG_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+NO_STRUCTURED_IMG_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
-    <title>Embedded Image Feed</title>
+    <title>No Structured Image Feed</title>
     <link>https://example.com</link>
     <description>Tests</description>
     <item>
-      <title>Article With Inline Image</title>
-      <link>https://example.com/articles/inline</link>
-      <description><![CDATA[<p>Lead paragraph</p><img src="https://cdn.example.com/hero.jpg" alt="hero"/><p>More text</p>]]></description>
+      <title>Article Whose Hero Image Is Only In OG Meta</title>
+      <link>https://example.com/articles/og-only</link>
+      <description><![CDATA[<p>Body text without any image tags.</p>]]></description>
       <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
     </item>
   </channel>
 </rss>
 """
+
+OG_IMAGE_HTML = (
+    "<html><head>"
+    '<meta property="og:image" content="https://cdn.example.com/og-hero.jpg"/>'
+    "</head><body>...</body></html>"
+)
 
 EMPTY_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -201,9 +207,27 @@ async def test_full_rss_extracts_title_text_image_and_timestamp() -> None:
     assert second.image_url == "https://example.com/img/cats.png"
 
 
-async def test_image_falls_back_to_inline_img_tag_in_description() -> None:
+async def test_image_falls_back_to_og_image_when_structured_locations_empty() -> None:
     scraper = TheOnionScraper()
-    handler, _ = _make_handler(scraper.feed_url, EMBEDDED_IMG_RSS)
+    article_url = "https://example.com/articles/og-only"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        if str(request.url) == scraper.feed_url:
+            return httpx.Response(
+                200,
+                content=NO_STRUCTURED_IMG_RSS.encode("utf-8"),
+                headers={"content-type": "application/rss+xml"},
+            )
+        if str(request.url) == article_url:
+            return httpx.Response(
+                200,
+                content=OG_IMAGE_HTML.encode("utf-8"),
+                headers={"content-type": "text/html"},
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
     _wire_transport(scraper, handler)
     try:
         items = [item async for item in scraper.scrape()]
@@ -211,7 +235,7 @@ async def test_image_falls_back_to_inline_img_tag_in_description() -> None:
         await scraper.close()
 
     assert len(items) == 1
-    assert items[0].image_url == "https://cdn.example.com/hero.jpg"
+    assert items[0].image_url == "https://cdn.example.com/og-hero.jpg"
 
 
 async def test_missing_optional_fields_yield_graceful_defaults() -> None:
