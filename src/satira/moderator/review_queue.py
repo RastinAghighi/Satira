@@ -2,7 +2,7 @@ import hashlib
 import math
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from satira.graph.schema import EdgeType
 from satira.graph.store import GraphStore
@@ -91,7 +91,7 @@ class ReviewQueueManager:
         if cluster is None:
             raise KeyError(f"unknown cluster {cluster_id!r}")
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         for member in cluster.members:
             self._pending.pop(member.id, None)
             self._human_resolved_count += 1
@@ -106,7 +106,7 @@ class ReviewQueueManager:
         return len(cluster.members)
 
     def process_stale_items(self) -> int:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         stale_ids = [iid for iid, it in self._pending.items() if it.auto_resolve_at <= now]
         for iid in stale_ids:
             item = self._pending.pop(iid)

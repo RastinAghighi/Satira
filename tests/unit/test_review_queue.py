@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from satira.graph.schema import ContentNode, EdgeType, EntityNode
 from satira.graph.store import GraphStore
@@ -33,7 +33,7 @@ def _make_item(
         mention_text=text,
         candidate_entities=cands,
         similarity_score=cands[0][1] if cands else 0.0,
-        created_at=created_at or datetime.utcnow(),
+        created_at=created_at or datetime.now(timezone.utc),
         auto_resolve_at=auto_resolve_at,
         affected_content_count=affected,
         embedding_impact=embedding_impact,
@@ -106,7 +106,7 @@ def test_process_stale_items_auto_resolves_old_items() -> None:
     store.add_entity(_entity("e1"))
     mgr = ReviewQueueManager(store)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     fresh = _make_item("fresh", created_at=now, auto_resolve_at=now + timedelta(minutes=30))
     stale = _make_item(
         "stale",
@@ -218,7 +218,7 @@ def test_stats_reports_queue_depth_and_auto_resolve_rate() -> None:
     store.add_entity(_entity("e1"))
     mgr = ReviewQueueManager(store)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     mgr.push(_make_item("a", auto_resolve_at=now - timedelta(minutes=1)))
     mgr.push(_make_item("b"))
     mgr.process_stale_items()

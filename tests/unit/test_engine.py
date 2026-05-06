@@ -132,10 +132,6 @@ def test_state_dict_round_trip(tmp_path) -> None:
     engine = _make_engine()
     engine.eval()
 
-    v, t, temp, graph = _make_inputs(batch=2)
-    with torch.no_grad():
-        original_logits, *_ = engine(v, t, temp, graph)
-
     path = tmp_path / "engine.pt"
     torch.save(engine.state_dict(), path)
 
@@ -143,7 +139,9 @@ def test_state_dict_round_trip(tmp_path) -> None:
     restored.load_state_dict(torch.load(path))
     restored.eval()
 
+    v, t, temp, graph = _make_inputs(batch=2)
     with torch.no_grad():
+        original_logits, *_ = engine(v, t, temp, graph)
         restored_logits, *_ = restored(v, t, temp, graph)
 
     assert torch.allclose(original_logits, restored_logits, atol=1e-6)
