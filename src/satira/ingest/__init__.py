@@ -14,6 +14,12 @@ from satira.ingest.satire_scrapers import (
     SatireScraperRegistry,
     TheOnionScraper,
 )
+from satira.ingest.source_credibility import (
+    KNOWN_NEWS,
+    KNOWN_SATIRE,
+    SourceClassification,
+    SourceCredibilityClassifier,
+)
 
 __all__ = [
     "BabylonBeeScraper",
@@ -22,6 +28,8 @@ __all__ = [
     "ExtractedEntity",
     "GDELTScraper",
     "ImageDownloader",
+    "KNOWN_NEWS",
+    "KNOWN_SATIRE",
     "NewsScraperRegistry",
     "ProcessedItem",
     "ReductressScraper",
@@ -29,5 +37,7 @@ __all__ = [
     "SatireScraperRegistry",
     "ScrapedItem",
     "ScraperStats",
+    "SourceClassification",
+    "SourceCredibilityClassifier",
     "TheOnionScraper",
 ]
