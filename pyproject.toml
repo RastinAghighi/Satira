@@ -19,6 +19,8 @@ faiss-cpu = "^1.8"
 easyocr = "^1.7"
 redis = "^5.0"
 feedparser = "^6.0"
+Pillow = "^10.3"
+ImageHash = "^4.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1"
