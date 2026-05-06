@@ -57,7 +57,7 @@ class TestCuratedTier:
         assert "allowlist" in verdict.reasoning
 
     @pytest.mark.parametrize(
-        "domain", ["reuters.com", "apnews.com", "bbc.co.uk", "npr.org"]
+        "domain", ["reuters.com", "bbc.co.uk", "npr.org", "theguardian.com"]
     )
     def test_known_news(self, clf, domain):
         verdict = clf.classify(domain)

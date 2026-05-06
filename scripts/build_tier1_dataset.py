@@ -69,13 +69,19 @@ logger = logging.getLogger("satira.build_tier1")
 # rather than a heavy filter.
 DEFAULT_GDELT_QUERIES: tuple[str, ...] = (
     "domain:reuters.com",
-    "domain:apnews.com",
     "domain:bbc.com",
     "domain:npr.org",
     "domain:theguardian.com",
     "domain:nytimes.com",
     "domain:washingtonpost.com",
 )
+
+# Some feeds (NPR, Al Jazeera) don't carry images in their RSS, so the
+# items they contribute are necessarily text-only. We keep them — a
+# labelled headline is still training signal — but cap the share so
+# they don't crowd out the multimodal items the model is actually being
+# trained on.
+_MAX_TEXT_ONLY_FRAC = 0.20
 
 LABEL_AUTHENTIC = 0
 LABEL_SATIRE = 1
@@ -240,6 +246,50 @@ async def download_images(
 
 
 # --- label verification ------------------------------------------------------
+def cap_text_only_per_label(
+    verified: list[tuple[ProcessedItem, int]],
+    max_frac: float = _MAX_TEXT_ONLY_FRAC,
+) -> tuple[list[tuple[ProcessedItem, int]], int]:
+    """Cap text-only items at ``max_frac`` of each label's total.
+
+    NPR and Al Jazeera publish RSS without images, so their entries
+    arrive here as text-only items. Without a cap they can dominate the
+    news side of the dataset (especially when image-bearing feeds lose
+    items to download failures), tilting Tier 1 toward a text-only
+    mix. We cap *per label* so satire and news bins are balanced
+    independently.
+
+    Returns ``(kept, dropped_count)``. Items are dropped from the tail
+    of the text-only list so the cap is deterministic for a given input
+    order.
+    """
+    by_label: dict[int, list[tuple[ProcessedItem, int]]] = defaultdict(list)
+    for entry in verified:
+        by_label[entry[1]].append(entry)
+
+    kept: list[tuple[ProcessedItem, int]] = []
+    dropped = 0
+    for label, group in by_label.items():
+        with_image = [e for e in group if e[0].image_path is not None]
+        text_only = [e for e in group if e[0].image_path is None]
+        if not text_only:
+            kept.extend(with_image)
+            continue
+        # max_frac = text_kept / (with_image + text_kept)
+        # → text_kept = max_frac * with_image / (1 - max_frac)
+        if max_frac >= 1.0:
+            cap = len(text_only)
+        elif max_frac <= 0.0 or not with_image:
+            cap = 0
+        else:
+            cap = int(max_frac * len(with_image) / (1 - max_frac))
+        kept_text = text_only[:cap]
+        kept.extend(with_image)
+        kept.extend(kept_text)
+        dropped += len(text_only) - len(kept_text)
+    return kept, dropped
+
+
 def verify_labels(
     items: list[ProcessedItem],
 ) -> tuple[list[tuple[ProcessedItem, int]], Counter]:
@@ -372,7 +422,18 @@ async def run(args: argparse.Namespace) -> int:
     verified, drops = verify_labels(deduped)
     print(f"[verify] kept={len(verified)} drops={dict(drops)}")
 
-    records = [to_record(item, label) for item, label in verified]
+    capped, text_only_dropped = cap_text_only_per_label(verified)
+    text_only_kept = sum(1 for it, _ in capped if it.image_path is None)
+    total_capped = len(capped)
+    text_only_frac = (text_only_kept / total_capped) if total_capped else 0.0
+    print(
+        f"[cap] text_only_kept={text_only_kept} "
+        f"text_only_dropped={text_only_dropped} "
+        f"text_only_frac={text_only_frac:.1%} "
+        f"(max={_MAX_TEXT_ONLY_FRAC:.0%})"
+    )
+
+    records = [to_record(item, label) for item, label in capped]
     train, val, test = stratified_split(records, 0.8, 0.1, args.seed)
     print(f"[split] train={len(train)} val={len(val)} test={len(test)}")
 

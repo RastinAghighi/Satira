@@ -23,11 +23,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import imagehash
 from PIL import Image, UnidentifiedImageError
@@ -40,6 +42,40 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_FORMATS = {"PNG", "JPEG", "WEBP"}
 _FORMAT_EXT = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}
+
+# Rotated per request to dodge image CDNs that block the default httpx
+# User-Agent. Mix of recent desktop Chrome/Firefox/Safari strings —
+# nothing exotic, just "looks like a browser someone might actually use."
+_BROWSER_USER_AGENTS: tuple[str, ...] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) "
+    "Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+)
+
+
+def _build_image_request_headers(article_url: str | None) -> dict[str, str]:
+    """Pick a rotating UA and derive a Referer from the article URL.
+
+    Some news image CDNs (Guardian, NYT, BBC) 403 the default httpx
+    User-Agent or hot-link a request that arrives without a Referer
+    pointing at the article's host. Mimicking a browser fixes both.
+    """
+    headers: dict[str, str] = {
+        "User-Agent": random.choice(_BROWSER_USER_AGENTS),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    if article_url:
+        parsed = urlparse(article_url)
+        if parsed.scheme and parsed.netloc:
+            headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+    return headers
 
 
 @dataclass(kw_only=True)
@@ -113,7 +149,8 @@ class ImageDownloader:
         if not item.image_url:
             return None
 
-        data = await self._scraper.fetch_image(item.image_url)
+        headers = _build_image_request_headers(item.source_url)
+        data = await self._scraper.fetch_image(item.image_url, headers=headers)
         if data is None:
             return None
         if len(data) > self.max_size_bytes:

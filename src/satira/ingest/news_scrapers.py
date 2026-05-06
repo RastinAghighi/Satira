@@ -9,7 +9,7 @@ Two flavours live here. :class:`GDELTScraper` queries the public
 GDELT 2.0 DOC API — free, machine-readable, and uniform per record,
 which means we never have to scrape article HTML. :class:`RSSNewsScraper`
 is a generic ``feedparser`` wrapper pre-configured for major outlets
-(BBC, AP, NPR, Guardian, NYT, Al Jazeera); it mirrors the satire RSS
+(BBC, NPR, Guardian, NYT, Al Jazeera); it mirrors the satire RSS
 scrapers
 so the test scaffolding and quirks (image extraction, bozo-feed
 handling, …) carry over almost verbatim.
@@ -54,6 +54,22 @@ _OG_IMAGE_CONTENT_FIRST = re.compile(
     re.IGNORECASE,
 )
 
+# BBC's RSS hands out 240-px thumbnails (240x135) which sit below the
+# downloader's 200x200 minimum. The same image is served at larger
+# sizes by the CDN via path substitution — rewriting the URL here is
+# cheaper than fetching the article HTML for og:image.
+_BBC_THUMB_PATH_RE = re.compile(r"/ace/standard/240/")
+_BBC_IC_THUMB_PATH_RE = re.compile(r"/images/ic/240x135/")
+
+
+def _upgrade_thumbnail_url(url: str) -> str:
+    """Rewrite known low-res RSS thumbnail URLs to a larger CDN size."""
+    if _BBC_THUMB_PATH_RE.search(url):
+        return _BBC_THUMB_PATH_RE.sub("/ace/standard/1024/", url)
+    if _BBC_IC_THUMB_PATH_RE.search(url):
+        return _BBC_IC_THUMB_PATH_RE.sub("/images/ic/1024x576/", url)
+    return url
+
 
 HtmlFetcher = Callable[[str], Awaitable[str | None]]
 
@@ -62,26 +78,32 @@ async def _extract_image_url(
     entry: Any,
     *,
     fetcher: HtmlFetcher | None = None,
-) -> str | None:
+) -> tuple[str | None, str]:
     """Pull a featured image URL from an RSS entry, trying common locations.
 
     Order: ``enclosure`` → ``media:thumbnail`` → ``media:content`` →
-    ``og:image`` from the article page (only if ``fetcher`` is provided
-    and the structured locations all came up empty — fetching every
-    article HTML just for an image would otherwise gut throughput).
+    ``og:image`` from the article page (tertiary fallback — only fired
+    when ``fetcher`` is provided and the structured locations all came
+    up empty, since fetching every article HTML just for an image would
+    otherwise gut throughput).
+
+    Returns ``(url_or_none, strategy)`` where ``strategy`` names the
+    location the URL came from (``enclosure``, ``media_thumbnail``,
+    ``media_content``, ``og_image``, or ``none``) so the caller can log
+    which path each item took.
     """
     enclosures = getattr(entry, "enclosures", None) or []
     for enc in enclosures:
         etype = (enc.get("type") or "").lower()
         href = enc.get("href") or enc.get("url")
         if href and (etype.startswith("image/") or not etype):
-            return href
+            return href, "enclosure"
 
     media_thumb = getattr(entry, "media_thumbnail", None)
     if media_thumb:
         url = media_thumb[0].get("url")
         if url:
-            return url
+            return _upgrade_thumbnail_url(url), "media_thumbnail"
 
     media_content = getattr(entry, "media_content", None)
     if media_content:
@@ -92,16 +114,16 @@ async def _extract_image_url(
             if url and (
                 mtype.startswith("image/") or medium == "image" or not mtype
             ):
-                return url
+                return _upgrade_thumbnail_url(url), "media_content"
 
     if fetcher is not None:
         link = (getattr(entry, "link", "") or "").strip()
         if link:
             og = await _extract_og_image(link, fetcher)
             if og:
-                return og
+                return og, "og_image"
 
-    return None
+    return None, "none"
 
 
 async def _extract_og_image(article_url: str, fetcher: HtmlFetcher) -> str | None:
@@ -301,20 +323,21 @@ class GDELTScraper(BaseScraper):
 class RSSNewsScraper(BaseScraper):
     """Generic RSS scraper pre-wired for major news outlets.
 
-    The default feed list covers BBC, AP, NPR, the Guardian, the New
-    York Times, and Al Jazeera — between them we get broad coverage
-    with stable feeds that don't change shape monthly. Per-feed
-    metadata (outlet display name and canonical domain) is stamped on
-    each item so downstream code can score credibility without
-    re-parsing the URL.
+    The default feed list covers BBC, NPR, the Guardian, the New York
+    Times, and Al Jazeera — between them we get broad coverage with
+    stable feeds that don't change shape monthly. Per-feed metadata
+    (outlet display name and canonical domain) is stamped on each item
+    so downstream code can score credibility without re-parsing the
+    URL.
 
     Reuters' public RSS endpoints were retired and now return zero
     entries; NYT World and Al Jazeera fill the same global-news slot.
+    The AP top-news feed went dead in 2026 (zero entries on every
+    fetch) and was dropped from the registry.
     """
 
     DEFAULT_FEEDS: dict[str, str] = {
         "bbc_news": "http://feeds.bbci.co.uk/news/rss.xml",
-        "ap_top": "https://feeds.apnews.com/rss/apf-topnews",
         "npr_news": "https://feeds.npr.org/1001/rss.xml",
         "guardian_world": "https://www.theguardian.com/world/rss",
         "nyt_world": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
@@ -323,7 +346,6 @@ class RSSNewsScraper(BaseScraper):
 
     DEFAULT_OUTLETS: dict[str, tuple[str, str]] = {
         "bbc_news": ("BBC", "bbc.co.uk"),
-        "ap_top": ("Associated Press", "apnews.com"),
         "npr_news": ("NPR", "npr.org"),
         "guardian_world": ("The Guardian", "theguardian.com"),
         "nyt_world": ("The New York Times", "nytimes.com"),
@@ -351,6 +373,14 @@ class RSSNewsScraper(BaseScraper):
         if max_per_feed <= 0:
             return
         keys = feed_keys if feed_keys is not None else list(self.feeds.keys())
+
+        # Two-pass design: fetch all feeds first, then interleave their
+        # entries so the consumer's max_items budget is shared fairly.
+        # The previous "feed-by-feed" iteration meant the first feed
+        # alone could fill a small budget — concretely, BBC's 31
+        # entries would crowd out NPR / Guardian / NYT / Al Jazeera
+        # whenever ``max_items`` was below ~150.
+        feed_payloads: list[tuple[str, str, str, str, list[Any]]] = []
         for key in keys:
             feed_url = self.feeds.get(key)
             if not feed_url:
@@ -382,9 +412,20 @@ class RSSNewsScraper(BaseScraper):
                 )
                 continue
 
-            for entry in feed.entries[:max_per_feed]:
+            feed_payloads.append(
+                (key, outlet_name, source_domain, feed_url, list(feed.entries[:max_per_feed]))
+            )
+
+        if not feed_payloads:
+            return
+
+        max_len = max(len(p[4]) for p in feed_payloads)
+        for idx in range(max_len):
+            for key, outlet_name, source_domain, feed_url, entries in feed_payloads:
+                if idx >= len(entries):
+                    continue
                 item = await self._entry_to_item(
-                    entry,
+                    entries[idx],
                     feed_key=key,
                     outlet_name=outlet_name,
                     source_domain=source_domain,
@@ -413,7 +454,15 @@ class RSSNewsScraper(BaseScraper):
             or getattr(entry, "description", "")
             or ""
         )
-        image_url = await _extract_image_url(entry, fetcher=self.fetch)
+        image_url, image_strategy = await _extract_image_url(
+            entry, fetcher=self.fetch
+        )
+        logger.info(
+            "RSSNewsScraper: feed=%s strategy=%s image=%s",
+            feed_key,
+            image_strategy,
+            image_url or "<none>",
+        )
         return ScrapedItem(
             source_url=url,
             image_url=image_url,
@@ -427,6 +476,7 @@ class RSSNewsScraper(BaseScraper):
                 "outlet": outlet_name,
                 "feed_key": feed_key,
                 "feed_url": feed_url,
+                "image_strategy": image_strategy,
             },
         )
 

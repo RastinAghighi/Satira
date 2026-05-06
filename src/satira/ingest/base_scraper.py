@@ -121,14 +121,21 @@ class BaseScraper(ABC):
             return None
         return response.text
 
-    async def fetch_image(self, url: str) -> bytes | None:
+    async def fetch_image(
+        self, url: str, *, headers: dict[str, str] | None = None
+    ) -> bytes | None:
         """Fetch ``url`` as raw bytes, validating the content type.
+
+        ``headers`` lets the caller layer on per-request headers
+        (e.g. a rotating User-Agent or a Referer matching the article
+        host) on top of the client's defaults — some image CDNs reject
+        the bare httpx UA or hot-link with no Referer.
 
         Returns ``None`` if the content-type is not ``image/*`` — saves
         a downstream image decoder from being handed an HTML error page
         dressed up with an ``.jpg`` extension.
         """
-        response = await self._request(url)
+        response = await self._request(url, headers=headers)
         if response is None:
             return None
         ctype = response.headers.get("content-type", "").lower()
@@ -162,7 +169,9 @@ class BaseScraper(ABC):
         await self.close()
 
     # --- request pipeline ----------------------------------------------
-    async def _request(self, url: str) -> httpx.Response | None:
+    async def _request(
+        self, url: str, *, headers: dict[str, str] | None = None
+    ) -> httpx.Response | None:
         if self.respect_robots and not await self._check_robots_txt(url):
             self.stats.robots_blocked += 1
             logger.info("robots.txt disallows %s — skipping", url)
@@ -174,7 +183,7 @@ class BaseScraper(ABC):
             await self._enforce_rate_limit()
             self.stats.requests_sent += 1
             try:
-                response = await client.get(url)
+                response = await client.get(url, headers=headers)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_exc = exc
                 self.stats.requests_failed += 1

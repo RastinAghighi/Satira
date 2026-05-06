@@ -483,7 +483,6 @@ async def test_rss_news_default_feeds_cover_known_outlets() -> None:
         await scraper.close()
     assert keys == {
         "bbc_news",
-        "ap_top",
         "npr_news",
         "guardian_world",
         "nyt_world",

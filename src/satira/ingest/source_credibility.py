@@ -134,7 +134,6 @@ KNOWN_SATIRE: frozenset[str] = frozenset({
 
 KNOWN_NEWS: frozenset[str] = frozenset({
     "reuters.com",
-    "apnews.com",
     "bbc.com",
     "bbc.co.uk",
     "npr.org",
