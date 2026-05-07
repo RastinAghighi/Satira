@@ -39,9 +39,9 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
 
 from satira.ingest.base_scraper import ScrapedItem
+from satira.ingest.domain_utils import normalize_domain
 
 
 logger = logging.getLogger(__name__)
@@ -74,16 +74,6 @@ class HFDatasetSpec:
 
 
 # --- adapters ---------------------------------------------------------------
-def _domain_from_url(url: str) -> str:
-    if not url:
-        return ""
-    try:
-        host = urlparse(url).netloc.lower()
-    except ValueError:
-        return ""
-    return host[4:] if host.startswith("www.") else host
-
-
 def _now_utc() -> datetime:
     # HF rows usually don't carry timestamps. We stamp the load time so
     # the temporal index has *something* monotonic to sort on; downstream
@@ -106,7 +96,7 @@ def _adapt_sarcasm_news_headline(row: dict[str, Any]) -> ScrapedItem | None:
         return None
     label = _LABEL_SATIRE if is_sarcastic == 1 else _LABEL_AUTHENTIC
     url = (row.get("article_link") or "").strip()
-    domain = _domain_from_url(url) or (
+    domain = normalize_domain(url) or (
         "theonion.com" if label == _LABEL_SATIRE else "huffpost.com"
     )
     return ScrapedItem(
@@ -159,10 +149,22 @@ def _adapt_biddls_onion(row: dict[str, Any]) -> ScrapedItem | None:
 
 
 KNOWN_SATIRE_DATASETS: tuple[HFDatasetSpec, ...] = (
-    HFDatasetSpec(
-        dataset_id="raquiba/Sarcasm_News_Headline",
-        adapter=_adapt_sarcasm_news_headline,
-    ),
+    # ``raquiba/Sarcasm_News_Headline`` (the "Onion-or-Not"-style
+    # Onion vs HuffPost headline corpus) is intentionally disabled.
+    # Two reasons:
+    #   1. It's headlines-only — average text length is ~73 chars,
+    #      well below the 300+ chars RSS/GDELT items carry. Mixing
+    #      both would let the model learn "short text == satire".
+    #   2. Several rows have malformed ``article_link`` values
+    #      (embedded second URL), which surfaced as the corrupt source
+    #      ``huffingtonpost.comhttp:`` in past Tier 1 runs.
+    # The adapter and spec are left in the source so the dataset can
+    # be re-enabled later if either issue gets addressed upstream.
+    #
+    # HFDatasetSpec(
+    #     dataset_id="raquiba/Sarcasm_News_Headline",
+    #     adapter=_adapt_sarcasm_news_headline,
+    # ),
     HFDatasetSpec(
         dataset_id="Biddls/Onion_News",
         adapter=_adapt_biddls_onion,

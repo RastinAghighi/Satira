@@ -24,13 +24,14 @@ import json
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode, urljoin, urlparse
 
 import feedparser
 
 from satira.ingest.base_scraper import BaseScraper, ScrapedItem
+from satira.ingest.domain_utils import normalize_domain
 
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,41 @@ def _format_gdelt_datetime(dt: datetime) -> str:
     return dt.strftime("%Y%m%d%H%M%S")
 
 
+_TIMESPAN_UNITS: dict[str, int] = {"h": 1, "d": 24, "w": 24 * 7, "m": 24 * 30}
+
+
+def _start_date_from_timespan(timespan: str | None) -> datetime | None:
+    """Convert a GDELT-style ``timespan`` string to an absolute start date.
+
+    GDELT's DOC API takes a relative ``timespan=1d`` parameter on
+    single-shot ``search()`` calls, but the paginating ``scrape()``
+    cursor uses absolute ``startdatetime``/``enddatetime`` instead.
+    When :meth:`scrape_topics` swaps from search()-per-query to
+    paginating scrape()-per-query, callers that still pass ``timespan``
+    are honoured by translating to the equivalent start date here.
+
+    Returns ``None`` for empty or unparseable input — callers treat
+    that as "no lower bound" rather than raising, since the only
+    consequence is a wider history window.
+    """
+    if not timespan:
+        return None
+    s = timespan.strip().lower()
+    if not s:
+        return None
+    unit = s[-1]
+    if unit not in _TIMESPAN_UNITS:
+        return None
+    try:
+        n = int(s[:-1])
+    except ValueError:
+        return None
+    if n <= 0:
+        return None
+    hours = n * _TIMESPAN_UNITS[unit]
+    return datetime.now(timezone.utc) - timedelta(hours=hours)
+
+
 class GDELTScraper(BaseScraper):
     """Scrapes the GDELT Project's public DOC API for news articles.
 
@@ -222,7 +258,11 @@ class GDELTScraper(BaseScraper):
     DEFAULT_RATE_LIMIT_PER_MINUTE = 60  # GDELT allows ~1 req/sec.
 
     # Broad-topic queries tuned for diverse English-language coverage.
-    # Ten topics × 250 records ≈ 2500 articles per scrape_topics() pass.
+    # Twenty topics × 500 records ≈ 10000 articles per scrape_topics()
+    # pass. The list was widened from ten to twenty for Tier 1 to push
+    # the imaged-content yield up — most query budgets in Tier 1 are
+    # bottlenecked on per-query pagination + dedup, so adding topics
+    # buys more *unique* articles than raising max_per_query alone.
     DEFAULT_QUERIES: tuple[str, ...] = (
         "politics",
         "economy",
@@ -234,6 +274,16 @@ class GDELTScraper(BaseScraper):
         "business",
         "international",
         "sports",
+        "education",
+        "entertainment",
+        "culture",
+        "energy",
+        "immigration",
+        "transportation",
+        "finance",
+        "law",
+        "military",
+        "agriculture",
     )
 
     def __init__(self, **kwargs: Any) -> None:
@@ -370,7 +420,7 @@ class GDELTScraper(BaseScraper):
         self,
         queries: list[str] | tuple[str, ...] | None = None,
         *,
-        max_per_query: int = 250,
+        max_per_query: int = 500,
         timespan: str = "1d",
         sourcecountry: str | None = None,
         sourcelang: str | None = "english",
@@ -381,39 +431,40 @@ class GDELTScraper(BaseScraper):
         often surfaces the same article under multiple broad topics
         (e.g. an election story tagged ``politics`` and
         ``international``), and we don't want the same record in the
-        dataset twice. A single ``search()`` failure for one topic
-        logs and is skipped; the next topic still runs.
+        dataset twice. A single failure for one topic logs and is
+        skipped; the next topic still runs.
+
+        ``max_per_query`` may exceed :attr:`MAX_RECORDS_PER_CALL` (the
+        GDELT hard cap of 250). When it does, this method paginates
+        backwards through history per query — the same cursor walk
+        :meth:`scrape` uses — so callers can ask for 500-1000 records
+        per topic in one pass.
         """
         topics = (
             list(queries) if queries is not None else list(self.DEFAULT_QUERIES)
         )
+        start_date = _start_date_from_timespan(timespan)
         seen_urls: set[str] = set()
 
         for query in topics:
             try:
-                articles = await self.search(
+                async for item in self.scrape(
                     query,
-                    maxrecords=max_per_query,
-                    timespan=timespan,
+                    max_items=max_per_query,
+                    start_date=start_date,
                     sourcecountry=sourcecountry,
                     sourcelang=sourcelang,
-                )
+                ):
+                    if item.source_url and item.source_url in seen_urls:
+                        continue
+                    if item.source_url:
+                        seen_urls.add(item.source_url)
+                    yield item
             except Exception as exc:  # noqa: BLE001 — one query mustn't kill the loop
                 logger.exception(
-                    "GDELT scrape_topics: search failed for %r: %s", query, exc
+                    "GDELT scrape_topics: query %r failed: %s", query, exc
                 )
                 continue
-
-            for art in articles:
-                item = self._article_to_item(art, query)
-                if item is None:
-                    continue
-                if item.source_url and item.source_url in seen_urls:
-                    continue
-                if item.source_url:
-                    seen_urls.add(item.source_url)
-                self.stats.items_yielded += 1
-                yield item
 
     def _build_paginated_url(
         self,
@@ -447,9 +498,12 @@ class GDELTScraper(BaseScraper):
         if not url and not title:
             return None
 
-        domain = (art.get("domain") or "").strip().lower()
-        if not domain and url:
-            domain = urlparse(url).netloc.lower()
+        # Prefer the article record's ``domain`` field, but always pass
+        # it through ``normalize_domain`` so subdomains (politics.foo.com,
+        # local.foo.com) collapse onto the parent and the source-balance
+        # cap acts on the outlet rather than on its sections.
+        raw_domain = (art.get("domain") or "").strip().lower()
+        domain = normalize_domain(raw_domain) or normalize_domain(url)
 
         timestamp = _parse_gdelt_seendate(art.get("seendate") or "")
         image_url = (art.get("socialimage") or "").strip() or None
@@ -496,11 +550,11 @@ class RSSNewsScraper(BaseScraper):
     }
 
     DEFAULT_OUTLETS: dict[str, tuple[str, str]] = {
-        "bbc_news": ("BBC", "bbc.co.uk"),
-        "npr_news": ("NPR", "npr.org"),
-        "guardian_world": ("The Guardian", "theguardian.com"),
-        "nyt_world": ("The New York Times", "nytimes.com"),
-        "aljazeera_all": ("Al Jazeera", "aljazeera.com"),
+        "bbc_news": ("BBC", normalize_domain("bbc.co.uk")),
+        "npr_news": ("NPR", normalize_domain("npr.org")),
+        "guardian_world": ("The Guardian", normalize_domain("theguardian.com")),
+        "nyt_world": ("The New York Times", normalize_domain("nytimes.com")),
+        "aljazeera_all": ("Al Jazeera", normalize_domain("aljazeera.com")),
     }
 
     def __init__(
@@ -541,7 +595,7 @@ class RSSNewsScraper(BaseScraper):
                 continue
 
             outlet_name, source_domain = self.outlets.get(
-                key, (key, urlparse(feed_url).netloc.lower())
+                key, (key, normalize_domain(feed_url))
             )
 
             body = await self.fetch(feed_url)
