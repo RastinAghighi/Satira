@@ -196,23 +196,111 @@ def _format_gdelt_datetime(dt: datetime) -> str:
 class GDELTScraper(BaseScraper):
     """Scrapes the GDELT Project's public DOC API for news articles.
 
-    The DOC endpoint returns up to :attr:`MAX_RECORDS_PER_CALL` matching
-    articles per request. To honour callers asking for more we paginate
-    by walking the time window backwards using each batch's oldest
-    ``seendate``, so a single ``scrape()`` call still produces a single
-    async iterator regardless of how many underlying HTTP calls we made.
+    Two public entry points:
+
+    * :meth:`search` — one DOC API call, returns the raw article list.
+      Driven by ``timespan`` (e.g. ``"1d"``) plus optional language /
+      country filters. Use this when you want a single shot at a
+      specific topic and don't care about deep history.
+    * :meth:`scrape` — async iterator over ``ScrapedItem`` records for a
+      single query. Paginates backwards through history by walking the
+      oldest ``seendate`` returned per page; useful when you want more
+      than :attr:`MAX_RECORDS_PER_CALL` items for one query.
+    * :meth:`scrape_topics` — async iterator that fans :meth:`search`
+      across a list of broad topic queries (default
+      :attr:`DEFAULT_QUERIES`) and dedups results by URL across the
+      whole run. This is the high-volume path the Tier 1 builder uses.
+
+    Rate limiting defaults to 1 request/second, GDELT's stated public
+    cap; the base class honours this between every API call.
 
     API reference: https://api.gdeltproject.org/api/v2/doc/doc
     """
 
     API_URL = _GDELT_DOC_API
     MAX_RECORDS_PER_CALL = 250  # GDELT's hard cap.
+    DEFAULT_RATE_LIMIT_PER_MINUTE = 60  # GDELT allows ~1 req/sec.
+
+    # Broad-topic queries tuned for diverse English-language coverage.
+    # Ten topics × 250 records ≈ 2500 articles per scrape_topics() pass.
+    DEFAULT_QUERIES: tuple[str, ...] = (
+        "politics",
+        "economy",
+        "technology",
+        "science",
+        "health",
+        "climate",
+        "elections",
+        "business",
+        "international",
+        "sports",
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.setdefault(
+            "rate_limit_per_minute", self.DEFAULT_RATE_LIMIT_PER_MINUTE
+        )
+        super().__init__(**kwargs)
+
+    async def search(
+        self,
+        query: str,
+        *,
+        mode: str = "ArtList",
+        maxrecords: int = 250,
+        format: str = "json",
+        timespan: str = "1d",
+        sourcecountry: str | None = None,
+        sourcelang: str | None = "english",
+    ) -> list[dict[str, Any]]:
+        """Run one DOC API call and return its raw ``articles`` list.
+
+        Returns ``[]`` on any fetch / parse failure (logged at
+        ``WARNING``) so a single bad request can't take down a wider
+        :meth:`scrape_topics` loop.
+        """
+        if not query:
+            raise ValueError("GDELTScraper.search requires a non-empty query")
+        if maxrecords <= 0:
+            return []
+
+        params: dict[str, Any] = {
+            "query": query,
+            "mode": mode,
+            "format": format,
+            "maxrecords": min(maxrecords, self.MAX_RECORDS_PER_CALL),
+            "timespan": timespan,
+            "sort": "DateDesc",
+        }
+        if sourcecountry:
+            params["sourcecountry"] = sourcecountry
+        if sourcelang:
+            params["sourcelang"] = sourcelang
+
+        url = f"{self.API_URL}?{urlencode(params)}"
+        body = await self.fetch(url)
+        if body is None:
+            logger.warning("GDELT search: query %r — fetch failed or blocked", query)
+            return []
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "GDELT search: invalid JSON for query %r: %s", query, exc
+            )
+            return []
+        articles = data.get("articles")
+        if not isinstance(articles, list):
+            return []
+        return articles
 
     async def scrape(
         self,
         query: str,
         max_items: int = 500,
         start_date: datetime | None = None,
+        sourcecountry: str | None = None,
+        sourcelang: str | None = None,
         **_: Any,
     ) -> AsyncIterator[ScrapedItem]:
         if not query:
@@ -226,7 +314,14 @@ class GDELTScraper(BaseScraper):
 
         while emitted < max_items:
             page_size = min(max_items - emitted, self.MAX_RECORDS_PER_CALL)
-            url = self._build_url(query, page_size, end_dt, start_date)
+            url = self._build_paginated_url(
+                query=query,
+                page_size=page_size,
+                end_dt=end_dt,
+                start_date=start_date,
+                sourcecountry=sourcecountry,
+                sourcelang=sourcelang,
+            )
 
             body = await self.fetch(url)
             if body is None:
@@ -271,12 +366,64 @@ class GDELTScraper(BaseScraper):
                 return
             end_dt = oldest
 
-    def _build_url(
+    async def scrape_topics(
         self,
+        queries: list[str] | tuple[str, ...] | None = None,
+        *,
+        max_per_query: int = 250,
+        timespan: str = "1d",
+        sourcecountry: str | None = None,
+        sourcelang: str | None = "english",
+    ) -> AsyncIterator[ScrapedItem]:
+        """Iterate over a set of topic queries, yielding deduped items.
+
+        URLs are deduped across the *whole* run, not per query — GDELT
+        often surfaces the same article under multiple broad topics
+        (e.g. an election story tagged ``politics`` and
+        ``international``), and we don't want the same record in the
+        dataset twice. A single ``search()`` failure for one topic
+        logs and is skipped; the next topic still runs.
+        """
+        topics = (
+            list(queries) if queries is not None else list(self.DEFAULT_QUERIES)
+        )
+        seen_urls: set[str] = set()
+
+        for query in topics:
+            try:
+                articles = await self.search(
+                    query,
+                    maxrecords=max_per_query,
+                    timespan=timespan,
+                    sourcecountry=sourcecountry,
+                    sourcelang=sourcelang,
+                )
+            except Exception as exc:  # noqa: BLE001 — one query mustn't kill the loop
+                logger.exception(
+                    "GDELT scrape_topics: search failed for %r: %s", query, exc
+                )
+                continue
+
+            for art in articles:
+                item = self._article_to_item(art, query)
+                if item is None:
+                    continue
+                if item.source_url and item.source_url in seen_urls:
+                    continue
+                if item.source_url:
+                    seen_urls.add(item.source_url)
+                self.stats.items_yielded += 1
+                yield item
+
+    def _build_paginated_url(
+        self,
+        *,
         query: str,
         page_size: int,
         end_dt: datetime,
         start_date: datetime | None,
+        sourcecountry: str | None = None,
+        sourcelang: str | None = None,
     ) -> str:
         params: dict[str, Any] = {
             "query": query,
@@ -288,6 +435,10 @@ class GDELTScraper(BaseScraper):
         }
         if start_date is not None:
             params["startdatetime"] = _format_gdelt_datetime(start_date)
+        if sourcecountry:
+            params["sourcecountry"] = sourcecountry
+        if sourcelang:
+            params["sourcelang"] = sourcelang
         return f"{self.API_URL}?{urlencode(params)}"
 
     def _article_to_item(self, art: dict[str, Any], query: str) -> ScrapedItem | None:
@@ -506,6 +657,9 @@ class NewsScraperRegistry:
         self,
         gdelt_queries: list[str] | None = None,
         max_items: int = 1000,
+        gdelt_timespan: str = "1d",
+        gdelt_sourcecountry: str | None = None,
+        gdelt_sourcelang: str | None = "english",
     ) -> AsyncIterator[ScrapedItem]:
         if max_items <= 0:
             return
@@ -523,23 +677,25 @@ class NewsScraperRegistry:
         if not gdelt_queries:
             return
 
-        # Spread the remaining budget across queries so a noisy query
-        # can't starve the others.
+        # Spread the remaining budget across queries so a noisy topic
+        # can't starve the others. Cross-query URL dedup happens inside
+        # scrape_topics().
         remaining = max_items - emitted
         per_query = max(1, remaining // len(gdelt_queries))
-        for query in gdelt_queries:
-            try:
-                async for item in self.gdelt_scraper.scrape(
-                    query=query, max_items=per_query
-                ):
-                    yield item
-                    emitted += 1
-                    if emitted >= max_items:
-                        return
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "GDELTScraper failed for query %r: %s", query, exc
-                )
+        try:
+            async for item in self.gdelt_scraper.scrape_topics(
+                queries=list(gdelt_queries),
+                max_per_query=per_query,
+                timespan=gdelt_timespan,
+                sourcecountry=gdelt_sourcecountry,
+                sourcelang=gdelt_sourcelang,
+            ):
+                yield item
+                emitted += 1
+                if emitted >= max_items:
+                    return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("GDELTScraper.scrape_topics failed: %s", exc)
 
     async def close(self) -> None:
         await self.rss_scraper.close()

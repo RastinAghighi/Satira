@@ -330,6 +330,237 @@ async def test_gdelt_empty_query_raises() -> None:
         await scraper.close()
 
 
+async def test_gdelt_search_builds_url_with_timespan_and_filters() -> None:
+    scraper = _make_gdelt()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        seen.append(str(request.url))
+        return _json_response(GDELT_TWO_ARTICLES)
+
+    _wire_transport(scraper, handler)
+    try:
+        articles = await scraper.search(
+            "technology",
+            maxrecords=100,
+            timespan="2d",
+            sourcecountry="US",
+            sourcelang="english",
+        )
+    finally:
+        await scraper.close()
+
+    assert len(articles) == 2
+    assert len(seen) == 1
+    url = seen[0]
+    assert "query=technology" in url
+    assert "mode=ArtList" in url
+    assert "format=json" in url
+    assert "maxrecords=100" in url
+    assert "timespan=2d" in url
+    assert "sourcecountry=US" in url
+    assert "sourcelang=english" in url
+
+
+async def test_gdelt_search_caps_maxrecords_at_api_limit() -> None:
+    scraper = _make_gdelt()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        seen.append(str(request.url))
+        return _json_response(GDELT_EMPTY)
+
+    _wire_transport(scraper, handler)
+    try:
+        await scraper.search("x", maxrecords=10_000)
+    finally:
+        await scraper.close()
+
+    # Asking for 10k records still serialises as the GDELT hard cap (250).
+    assert any("maxrecords=250" in u for u in seen)
+
+
+async def test_gdelt_search_returns_empty_on_fetch_failure() -> None:
+    scraper = _make_gdelt()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _disallow_all_robots()
+        raise AssertionError("API should not be called when robots blocks")
+
+    _wire_transport(scraper, handler)
+    try:
+        articles = await scraper.search("x")
+    finally:
+        await scraper.close()
+    assert articles == []
+
+
+async def test_gdelt_search_returns_empty_on_invalid_json() -> None:
+    scraper = _make_gdelt()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        return httpx.Response(
+            200,
+            content=b"not json",
+            headers={"content-type": "application/json"},
+        )
+
+    _wire_transport(scraper, handler)
+    try:
+        articles = await scraper.search("x")
+    finally:
+        await scraper.close()
+    assert articles == []
+
+
+async def test_gdelt_search_empty_query_raises() -> None:
+    scraper = _make_gdelt()
+    try:
+        with pytest.raises(ValueError):
+            await scraper.search("")
+    finally:
+        await scraper.close()
+
+
+async def test_gdelt_scrape_topics_uses_default_queries() -> None:
+    scraper = _make_gdelt()
+    seen_queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        # Pull the query parameter out of the URL.
+        params = dict(request.url.params)
+        seen_queries.append(params.get("query", ""))
+        return _json_response(GDELT_EMPTY)
+
+    _wire_transport(scraper, handler)
+    try:
+        items = [item async for item in scraper.scrape_topics()]
+    finally:
+        await scraper.close()
+
+    assert items == []
+    assert seen_queries == list(GDELTScraper.DEFAULT_QUERIES)
+
+
+async def test_gdelt_scrape_topics_dedups_across_queries() -> None:
+    """Same article URL returned for two topics → emitted once total."""
+    scraper = _make_gdelt()
+
+    duplicate = {
+        "url": "https://example.com/shared",
+        "title": "Shared",
+        "seendate": "20260504T100000Z",
+        "domain": "example.com",
+        "socialimage": "https://example.com/img/s.jpg",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        return _json_response({"articles": [duplicate]})
+
+    _wire_transport(scraper, handler)
+    try:
+        items = [
+            item
+            async for item in scraper.scrape_topics(
+                queries=["politics", "international"], max_per_query=10
+            )
+        ]
+    finally:
+        await scraper.close()
+
+    assert len(items) == 1
+    assert items[0].source_url == "https://example.com/shared"
+    assert items[0].metadata["query"] == "politics"  # first wins
+
+
+async def test_gdelt_scrape_topics_continues_after_per_query_failure() -> None:
+    """A bad JSON page for one topic shouldn't break the next topic."""
+    scraper = _make_gdelt()
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(
+                200,
+                content=b"garbage",
+                headers={"content-type": "application/json"},
+            )
+        return _json_response(GDELT_TWO_ARTICLES)
+
+    _wire_transport(scraper, handler)
+    try:
+        items = [
+            item
+            async for item in scraper.scrape_topics(
+                queries=["politics", "technology"], max_per_query=10
+            )
+        ]
+    finally:
+        await scraper.close()
+
+    # First topic returned bad JSON (search → []); second topic returns 2.
+    assert len(items) == 2
+    assert all(i.metadata["source_type"] == "gdelt" for i in items)
+
+
+async def test_gdelt_scrape_topics_passes_filters_to_search() -> None:
+    scraper = _make_gdelt()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return _empty_robots()
+        seen.append(str(request.url))
+        return _json_response(GDELT_EMPTY)
+
+    _wire_transport(scraper, handler)
+    try:
+        async for _ in scraper.scrape_topics(
+            queries=["politics"],
+            timespan="3d",
+            sourcecountry="GB",
+            sourcelang="english",
+        ):
+            pass
+    finally:
+        await scraper.close()
+
+    assert len(seen) == 1
+    url = seen[0]
+    assert "timespan=3d" in url
+    assert "sourcecountry=GB" in url
+    assert "sourcelang=english" in url
+
+
+async def test_gdelt_default_queries_match_spec() -> None:
+    assert GDELTScraper.DEFAULT_QUERIES == (
+        "politics",
+        "economy",
+        "technology",
+        "science",
+        "health",
+        "climate",
+        "elections",
+        "business",
+        "international",
+        "sports",
+    )
+
+
 async def test_gdelt_falls_back_to_url_netloc_when_domain_missing() -> None:
     scraper = _make_gdelt()
 

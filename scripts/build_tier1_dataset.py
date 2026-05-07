@@ -50,6 +50,7 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from satira.ingest import (  # noqa: E402
+    GDELTScraper,
     ImageDownloader,
     NewsScraperRegistry,
     ProcessedItem,
@@ -63,18 +64,11 @@ from satira.ingest.source_credibility import NEWS, SATIRE  # noqa: E402
 logger = logging.getLogger("satira.build_tier1")
 
 
-# GDELT supports `domain:` filters in its query syntax — restricting the
-# query to known-credible outlets means the resulting items are NEWS by
-# construction and the post-scrape verification step is a sanity check
-# rather than a heavy filter.
-DEFAULT_GDELT_QUERIES: tuple[str, ...] = (
-    "domain:reuters.com",
-    "domain:bbc.com",
-    "domain:npr.org",
-    "domain:theguardian.com",
-    "domain:nytimes.com",
-    "domain:washingtonpost.com",
-)
+# Topic queries used when ``--use-gdelt`` is set. Ten broad topics ×
+# 250 records per topic ≈ 2500 raw articles per run before
+# cross-query dedup; comfortably enough headroom for a 5000-item
+# news target once RSS contributions are added in.
+DEFAULT_GDELT_QUERIES: tuple[str, ...] = GDELTScraper.DEFAULT_QUERIES
 
 # Some feeds (NPR, Al Jazeera) don't carry images in their RSS, so the
 # items they contribute are necessarily text-only. We keep them — a
@@ -121,6 +115,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Directory to store downloaded images (default: ./data/images).",
     )
     parser.add_argument(
+        "--use-gdelt",
+        action="store_true",
+        help=(
+            "Augment the RSS feeds with GDELT topic-based scraping "
+            "(adds ~2500 candidate articles across 10 broad topics)."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print what would be scraped without making any network calls.",
@@ -149,22 +151,29 @@ def setup_logging(level: str) -> None:
 
 
 # --- scraping ----------------------------------------------------------------
-async def scrape_news(target: int, dry_run: bool) -> list[ScrapedItem]:
+async def scrape_news(
+    target: int, *, use_gdelt: bool, dry_run: bool
+) -> list[ScrapedItem]:
     if dry_run:
         print(f"[dry-run] news: would scrape up to {target} items")
         print("[dry-run] news: RSS feeds (registry default):")
         for key in NewsScraperRegistry().rss_scraper.feeds:
             print(f"             - {key}")
-        print("[dry-run] news: GDELT queries:")
-        for q in DEFAULT_GDELT_QUERIES:
-            print(f"             - {q}")
+        if use_gdelt:
+            print("[dry-run] news: GDELT topic queries:")
+            for q in DEFAULT_GDELT_QUERIES:
+                print(f"             - {q}")
+        else:
+            print("[dry-run] news: GDELT disabled (pass --use-gdelt to enable)")
         return []
+
+    gdelt_queries = list(DEFAULT_GDELT_QUERIES) if use_gdelt else None
 
     items: list[ScrapedItem] = []
     async with NewsScraperRegistry() as registry:
         bar = tqdm(total=target, desc="news scrape", unit="item")
         async for item in registry.scrape_all(
-            gdelt_queries=list(DEFAULT_GDELT_QUERIES),
+            gdelt_queries=gdelt_queries,
             max_items=target,
         ):
             items.append(item)
@@ -390,10 +399,13 @@ async def run(args: argparse.Namespace) -> int:
     print(f"  target satire  : {args.target_satire}")
     print(f"  output dir     : {args.output_dir}")
     print(f"  image storage  : {args.image_storage}")
+    print(f"  use gdelt      : {args.use_gdelt}")
     print(f"  dry run        : {args.dry_run}")
     print(f"  seed           : {args.seed}")
 
-    news_items = await scrape_news(args.target_news, args.dry_run)
+    news_items = await scrape_news(
+        args.target_news, use_gdelt=args.use_gdelt, dry_run=args.dry_run
+    )
     satire_items = await scrape_satire(args.target_satire, args.dry_run)
 
     if args.dry_run:
