@@ -631,6 +631,39 @@ def verify_labels(
 
 
 # --- source balance ----------------------------------------------------------
+def _solve_source_caps(
+    counts: dict[str, int], max_frac: float, max_iter: int = 100
+) -> dict[str, int]:
+    """Find a per-source cap such that every source is ``<= max_frac`` of total.
+
+    Fixed-point iteration: cap every source at ``floor(max_frac * total)``,
+    then recompute total and repeat. When the system converges, every
+    surviving source's share is at most ``max_frac``.
+
+    With fewer than ``ceil(1/max_frac)`` sources the constraint is
+    infeasible (you can't have all 3 of 3 sources under 25% — they'd
+    sum to <75%). In that case we equalize to the smallest source's
+    count and bail out, so the caller still gets a balanced subset
+    rather than zero items.
+    """
+    if not counts:
+        return {}
+    if len(counts) * max_frac < 1:
+        target = min(counts.values())
+        return {s: target for s in counts}
+    cur = dict(counts)
+    for _ in range(max_iter):
+        total = sum(cur.values())
+        cap = int(max_frac * total)
+        if cap <= 0:
+            return {s: 0 for s in cur}
+        new = {s: min(c, cap) for s, c in cur.items()}
+        if new == cur:
+            return cur
+        cur = new
+    return cur
+
+
 def enforce_source_balance(
     verified: list[tuple[ProcessedItem, int]],
     *,
@@ -639,16 +672,15 @@ def enforce_source_balance(
 ) -> tuple[list[tuple[ProcessedItem, int]], Counter]:
     """Cap each source at ``max_frac`` of its label total via random subsample.
 
-    For every label, find any source whose share exceeds ``max_frac`` and
-    randomly downsample it to the cap. This is the post-collection
-    stratified-by-source step: we don't know up front how many items
-    each source will yield (download failures, dedup, language drops
-    all hit different feeds asymmetrically), so the cap has to apply
-    to the surviving population, not the targeted one.
+    Per-label so satire and news bins are balanced independently.
+    Within a label the cap is solved by :func:`_solve_source_caps`,
+    then each source is randomly downsampled (seeded) to its cap.
+    Random sampling is the stratification step: we don't know which
+    of an outlet's items are best, so picking uniformly is the
+    least-biased way to keep diversity within a source too.
 
-    Returns ``(kept, drops_per_source)`` where ``drops_per_source`` is a
-    counter keyed by the source domain so the summary stage can show
-    where the cap kicked in.
+    Returns ``(kept, drops_per_source)`` keyed by source domain so the
+    summary stage can show where the cap kicked in.
     """
     rng = random.Random(seed)
     by_label: dict[int, list[tuple[ProcessedItem, int]]] = defaultdict(list)
@@ -657,32 +689,38 @@ def enforce_source_balance(
 
     kept: list[tuple[ProcessedItem, int]] = []
     drops: Counter = Counter()
+    if max_frac <= 0 or max_frac >= 1:
+        for entries in by_label.values():
+            kept.extend(entries)
+        return kept, drops
+
     for label, group in by_label.items():
-        n = len(group)
-        if n == 0:
+        if not group:
             continue
-        cap = int(n * max_frac)
         by_source: dict[str, list[tuple[ProcessedItem, int]]] = defaultdict(list)
         for entry in group:
             by_source[entry[0].source_domain or "<unknown>"].append(entry)
+        original_counts = {s: len(es) for s, es in by_source.items()}
+        target_counts = _solve_source_caps(original_counts, max_frac)
         for source, entries in by_source.items():
-            if len(entries) <= cap or cap <= 0:
+            target = target_counts.get(source, len(entries))
+            if target >= len(entries):
                 kept.extend(entries)
                 continue
             shuffled = list(entries)
             rng.shuffle(shuffled)
-            kept.extend(shuffled[:cap])
-            dropped = len(shuffled) - cap
+            kept.extend(shuffled[:target])
+            dropped = len(shuffled) - target
             drops[source] += dropped
             logger.warning(
-                "source %s exceeds %.0f%% of label %s (%d / %d) — "
-                "downsampled to %d",
+                "source %s exceeds %.0f%% of label %s "
+                "(%d -> %d, dropped %d)",
                 source,
                 max_frac * 100,
                 _LABEL_NAMES[label],
                 len(entries),
-                n,
-                cap,
+                target,
+                dropped,
             )
     return kept, drops
 
@@ -790,8 +828,10 @@ def _print_split_stats(name: str, split: list[dict[str, Any]]) -> None:
         ts_min = min(timestamps)
         ts_max = max(timestamps)
         span_days = (ts_max - ts_min).days
+        # Plain ASCII arrow — the Windows console uses cp1252 by default
+        # and chokes on unicode arrows.
         print(
-            f"    date range: {ts_min.date()} → {ts_max.date()}  "
+            f"    date range: {ts_min.date()} -> {ts_max.date()}  "
             f"({span_days} day span, {len(timestamps)}/{n} dated)"
         )
     else:
