@@ -2,6 +2,11 @@
 
 from satira.ingest.base_scraper import BaseScraper, ScrapedItem, ScraperStats
 from satira.ingest.entity_extraction import EntityExtractor, ExtractedEntity
+from satira.ingest.huggingface_loader import (
+    KNOWN_SATIRE_DATASETS,
+    HFDatasetLoader,
+    HFDatasetSpec,
+)
 from satira.ingest.image_pipeline import ImageDownloader, ProcessedItem
 from satira.ingest.news_scrapers import (
     GDELTScraper,
@@ -27,9 +32,12 @@ __all__ = [
     "EntityExtractor",
     "ExtractedEntity",
     "GDELTScraper",
+    "HFDatasetLoader",
+    "HFDatasetSpec",
     "ImageDownloader",
     "KNOWN_NEWS",
     "KNOWN_SATIRE",
+    "KNOWN_SATIRE_DATASETS",
     "NewsScraperRegistry",
     "ProcessedItem",
     "ReductressScraper",

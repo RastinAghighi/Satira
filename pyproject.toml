@@ -23,6 +23,9 @@ Pillow = "^10.3"
 ImageHash = "^4.3"
 spacy = "^3.7"
 tqdm = "^4.66"
+datasets = "^2.19"
+rapidfuzz = "^3.9"
+langdetect = "^1.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1"

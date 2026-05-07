@@ -17,14 +17,24 @@ The pipeline runs in this order:
    feed entry with no hero image still contributes a labelled headline
    to the dataset.
 3. Download images via :class:`ImageDownloader` (validation + hashing).
-4. Deduplicate by perceptual hash. Text-only items pass through the
-   dedupe step untouched — they have no phash to compare on.
-5. Verify labels with :class:`SourceCredibilityClassifier` — drop only
+4. Quality filters — drop items with text shorter than
+   :data:`_MIN_TEXT_LEN`, truncate items longer than
+   :data:`_MAX_TEXT_LEN`, drop non-English items detected by
+   ``langdetect``, and drop items matching the NSFW keyword list.
+5. Deduplicate. URL exact match → fuzzy title (>95% similar via
+   ``rapidfuzz``) → perceptual hash (Hamming distance < 4) →
+   cross-tier check against any pre-existing Tier 2 / Tier 3 splits so
+   a Tier 1 item never collides with a harder-tier item.
+6. Verify labels with :class:`SourceCredibilityClassifier` — drop only
    items where the classifier directly contradicts the asserted label;
    leniency is fine here because curated allowlists already keep the
    tier "obvious".
-6. Stratified 80/10/10 split into train/val/test.
-7. Write JSONL splits to ``--output-dir`` and print summary stats.
+7. Cap text-only items per label at ``_MAX_TEXT_ONLY_FRAC``.
+8. Source balance: cap any single source at
+   :data:`_MAX_SOURCE_FRAC` of its label total. Stratified random
+   sampling per (label, source) keeps the surviving subset diverse.
+9. Stratified 80/10/10 split into train/val/test.
+10. Write JSONL splits to ``--output-dir`` and print rich summary stats.
 
 Run with ``--dry-run`` to see the targets and queries without making
 any network calls.
@@ -36,13 +46,32 @@ import asyncio
 import json
 import logging
 import random
+import re
 import sys
 import traceback
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
+
+try:  # langdetect's detect() is non-deterministic by default
+    from langdetect import DetectorFactory, LangDetectException, detect
+    DetectorFactory.seed = 0
+except ImportError as exc:  # pragma: no cover — surfaced at script entry
+    raise ImportError(
+        "langdetect is required for the Tier 1 build "
+        "(install via `poetry add langdetect`)"
+    ) from exc
+
+try:
+    from rapidfuzz import fuzz
+except ImportError as exc:  # pragma: no cover — surfaced at script entry
+    raise ImportError(
+        "rapidfuzz is required for the Tier 1 build "
+        "(install via `poetry add rapidfuzz`)"
+    ) from exc
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_PATH = REPO_ROOT / "src"
@@ -51,6 +80,7 @@ if str(SRC_PATH) not in sys.path:
 
 from satira.ingest import (  # noqa: E402
     GDELTScraper,
+    HFDatasetLoader,
     ImageDownloader,
     NewsScraperRegistry,
     ProcessedItem,
@@ -58,6 +88,7 @@ from satira.ingest import (  # noqa: E402
     ScrapedItem,
     SourceCredibilityClassifier,
 )
+from satira.ingest.huggingface_loader import KNOWN_SATIRE_DATASETS  # noqa: E402
 from satira.ingest.source_credibility import NEWS, SATIRE  # noqa: E402
 
 
@@ -76,6 +107,39 @@ DEFAULT_GDELT_QUERIES: tuple[str, ...] = GDELTScraper.DEFAULT_QUERIES
 # they don't crowd out the multimodal items the model is actually being
 # trained on.
 _MAX_TEXT_ONLY_FRAC = 0.20
+
+# Source diversity: cap any single source at this fraction of its label
+# total so the dataset isn't dominated by whichever feed happens to be
+# the most prolific that day (often one HuggingFace corpus on the
+# satire side, one wire service on the news side).
+_MAX_SOURCE_FRAC = 0.25
+
+# Quality filters.
+_MIN_TEXT_LEN = 50
+_MAX_TEXT_LEN = 5000
+
+# Title-fuzzy threshold: rapidfuzz returns 0–100, so 95 means ≥95%
+# similar. Catches near-identical headlines syndicated across outlets
+# (a wire-service story republished verbatim) without merging
+# headlines that just share a topic.
+_TITLE_FUZZ_THRESHOLD = 95
+
+# Perceptual-hash threshold passed through to ImageDownloader.
+_PHASH_HAMMING_THRESHOLD = 4
+
+# Conservative NSFW keyword filter — token boundaries enforced via
+# regex below. Intentionally narrow (clear-cut adult-content terms
+# only); a model-based filter is the long-term plan but a keyword
+# pass is enough at the Tier 1 "obvious" level.
+_NSFW_KEYWORDS: tuple[str, ...] = (
+    "porn", "porno", "xxx", "nsfw", "nude", "nudes", "naked",
+    "boobs", "tits", "pussy", "blowjob", "anal", "cum", "cumshot",
+    "hentai", "milf", "onlyfans", "camgirl", "deepthroat",
+)
+_NSFW_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _NSFW_KEYWORDS) + r")\b",
+    flags=re.IGNORECASE,
+)
 
 LABEL_AUTHENTIC = 0
 LABEL_SATIRE = 1
@@ -120,6 +184,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Augment the RSS feeds with GDELT topic-based scraping "
             "(adds ~2500 candidate articles across 10 broad topics)."
+        ),
+    )
+    parser.add_argument(
+        "--use-huggingface",
+        action="store_true",
+        help=(
+            "Augment the dataset with pre-labeled rows from curated "
+            "HuggingFace satire/news datasets (text-only). Combined with "
+            "--use-gdelt this typically yields 5000-10000 Tier 1 items."
+        ),
+    )
+    parser.add_argument(
+        "--hf-max-per-dataset",
+        type=int,
+        default=3000,
+        help="Max rows to pull from each HuggingFace dataset (default: 3000).",
+    )
+    parser.add_argument(
+        "--tier2-dir",
+        type=Path,
+        default=Path("./data/tier2"),
+        help=(
+            "Directory containing existing Tier 2 splits to exclude from "
+            "Tier 1 (cross-tier dedup). Missing directory = no exclusion."
+        ),
+    )
+    parser.add_argument(
+        "--tier3-dir",
+        type=Path,
+        default=Path("./data/tier3"),
+        help=(
+            "Directory containing existing Tier 3 splits to exclude from "
+            "Tier 1 (cross-tier dedup). Missing directory = no exclusion."
         ),
     )
     parser.add_argument(
@@ -207,6 +304,23 @@ async def scrape_satire(target: int, dry_run: bool) -> list[ScrapedItem]:
     return items
 
 
+# --- huggingface -------------------------------------------------------------
+async def load_huggingface(
+    max_per_dataset: int, dry_run: bool
+) -> list[ScrapedItem]:
+    if dry_run:
+        print(
+            f"[dry-run] huggingface: would load up to {max_per_dataset} rows "
+            "from each of:"
+        )
+        for spec in KNOWN_SATIRE_DATASETS:
+            print(f"             - {spec.dataset_id}")
+        return []
+
+    loader = HFDatasetLoader()
+    return await loader.load_all(max_per_dataset=max_per_dataset)
+
+
 # --- image download ----------------------------------------------------------
 def _as_text_only(item: ScrapedItem) -> ProcessedItem:
     """Wrap a no-image scraped item as a text-only :class:`ProcessedItem`."""
@@ -254,12 +368,194 @@ async def download_images(
     return processed, download_failures
 
 
+# --- quality filters ---------------------------------------------------------
+def _item_text(item: ProcessedItem) -> str:
+    """Best textual surface for filtering: title preferred, body as fallback."""
+    return (item.title or item.text or "").strip()
+
+
+def _looks_english(text: str) -> bool:
+    """Heuristic English check using ``langdetect``.
+
+    langdetect can throw on very short or numeric strings — a thrown
+    detection is treated as "skip the language gate" rather than a
+    hard drop, since the min-length filter already removes the worst
+    short-text cases.
+    """
+    if not text:
+        return False
+    try:
+        return detect(text) == "en"
+    except LangDetectException:
+        return True
+
+
+def quality_filter(
+    items: list[ProcessedItem],
+) -> tuple[list[ProcessedItem], Counter]:
+    """Apply text-length, language, and NSFW filters.
+
+    Items with text longer than :data:`_MAX_TEXT_LEN` are *truncated*
+    in place (mutating ``title``/``text``) rather than dropped — the
+    headline-style content this tier targets is rarely overlong, but
+    a verbose RSS body shouldn't be discarded for it.
+
+    Returns ``(kept, drops_counter)`` where the counter records each
+    drop reason.
+    """
+    kept: list[ProcessedItem] = []
+    drops: Counter = Counter()
+    for item in tqdm(items, desc="quality filter", unit="item"):
+        text = _item_text(item)
+        if len(text) < _MIN_TEXT_LEN:
+            drops["too_short"] += 1
+            continue
+        # Truncate, prefer the title field as that's what to_record
+        # serializes; fall back to text if there's no title.
+        if item.title and len(item.title) > _MAX_TEXT_LEN:
+            item.title = item.title[:_MAX_TEXT_LEN]
+            drops["truncated"] += 1
+        elif item.text and len(item.text) > _MAX_TEXT_LEN:
+            item.text = item.text[:_MAX_TEXT_LEN]
+            drops["truncated"] += 1
+        if _NSFW_RE.search(text):
+            drops["nsfw"] += 1
+            continue
+        if not _looks_english(text):
+            drops["non_english"] += 1
+            continue
+        kept.append(item)
+    return kept, drops
+
+
+# --- deduplication -----------------------------------------------------------
+def _norm_url(url: str | None) -> str:
+    if not url:
+        return ""
+    return url.strip().lower().rstrip("/")
+
+
+def _norm_title(title: str | None) -> str:
+    if not title:
+        return ""
+    return re.sub(r"\s+", " ", title.strip().lower())
+
+
+def dedup_by_url(items: list[ProcessedItem]) -> tuple[list[ProcessedItem], int]:
+    """Drop later items that share an exact source URL with an earlier one."""
+    seen: set[str] = set()
+    kept: list[ProcessedItem] = []
+    dropped = 0
+    for item in items:
+        key = _norm_url(item.source_url)
+        if key and key in seen:
+            dropped += 1
+            continue
+        if key:
+            seen.add(key)
+        kept.append(item)
+    return kept, dropped
+
+
+def dedup_by_title(
+    items: list[ProcessedItem], threshold: int = _TITLE_FUZZ_THRESHOLD
+) -> tuple[list[ProcessedItem], int]:
+    """Drop items whose normalized title is ≥``threshold``% similar to a kept one.
+
+    Comparison is bucketed by the first two characters of the
+    normalized title to keep the worst case bounded; in practice this
+    is the cheapest correctness/speed trade-off for tens of thousands
+    of headlines, and false negatives at the bucket boundary are rare
+    enough not to matter for Tier 1.
+    """
+    kept: list[ProcessedItem] = []
+    buckets: dict[str, list[str]] = defaultdict(list)
+    dropped = 0
+    for item in items:
+        norm = _norm_title(item.title)
+        if not norm:
+            kept.append(item)
+            continue
+        bucket_key = norm[:2]
+        is_dup = False
+        for prev in buckets[bucket_key]:
+            if fuzz.ratio(norm, prev) >= threshold:
+                is_dup = True
+                break
+        if is_dup:
+            dropped += 1
+            continue
+        buckets[bucket_key].append(norm)
+        kept.append(item)
+    return kept, dropped
+
+
+def _load_cross_tier_keys(*tier_dirs: Path) -> tuple[set[str], set[str]]:
+    """Collect URL and normalized-title keys from existing Tier 2/3 splits.
+
+    Returns ``(urls, titles)``. Missing directories or unreadable files
+    are silently skipped — the cross-tier check is best-effort. Reads
+    every ``*.jsonl`` under each directory.
+    """
+    urls: set[str] = set()
+    titles: set[str] = set()
+    for tier_dir in tier_dirs:
+        if not tier_dir.exists():
+            continue
+        for path in sorted(tier_dir.glob("*.jsonl")):
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        url = _norm_url(
+                            (row.get("metadata") or {}).get("source_url")
+                            or row.get("source_url")
+                        )
+                        if url:
+                            urls.add(url)
+                        title = _norm_title(row.get("text") or row.get("title"))
+                        if title:
+                            titles.add(title)
+            except OSError as exc:
+                logger.warning("could not read %s for cross-tier dedup: %s", path, exc)
+    return urls, titles
+
+
+def drop_cross_tier(
+    items: list[ProcessedItem], tier2_dir: Path, tier3_dir: Path
+) -> tuple[list[ProcessedItem], int]:
+    """Remove items already present in Tier 2 / Tier 3 splits."""
+    urls, titles = _load_cross_tier_keys(tier2_dir, tier3_dir)
+    if not urls and not titles:
+        return items, 0
+    kept: list[ProcessedItem] = []
+    dropped = 0
+    for item in items:
+        url = _norm_url(item.source_url)
+        title = _norm_title(item.title)
+        if (url and url in urls) or (title and title in titles):
+            dropped += 1
+            continue
+        kept.append(item)
+    return kept, dropped
+
+
 # --- label verification ------------------------------------------------------
+def _is_huggingface_origin(item: ProcessedItem) -> bool:
+    return (item.metadata or {}).get("source_type") == "huggingface"
+
+
 def cap_text_only_per_label(
     verified: list[tuple[ProcessedItem, int]],
     max_frac: float = _MAX_TEXT_ONLY_FRAC,
 ) -> tuple[list[tuple[ProcessedItem, int]], int]:
-    """Cap text-only items at ``max_frac`` of each label's total.
+    """Cap *scraped* text-only items at ``max_frac`` of each label's total.
 
     NPR and Al Jazeera publish RSS without images, so their entries
     arrive here as text-only items. Without a cap they can dominate the
@@ -267,6 +563,11 @@ def cap_text_only_per_label(
     items to download failures), tilting Tier 1 toward a text-only
     mix. We cap *per label* so satire and news bins are balanced
     independently.
+
+    Items sourced from curated HuggingFace datasets are *exempt* from
+    the cap and pass through untouched: they are intentionally
+    text-only, large in volume, and the original RSS-feed concern
+    (missing thumbnails on a few outlets) doesn't apply to them.
 
     Returns ``(kept, dropped_count)``. Items are dropped from the tail
     of the text-only list so the cap is deterministic for a given input
@@ -281,21 +582,25 @@ def cap_text_only_per_label(
     for label, group in by_label.items():
         with_image = [e for e in group if e[0].image_path is not None]
         text_only = [e for e in group if e[0].image_path is None]
-        if not text_only:
+        hf_text = [e for e in text_only if _is_huggingface_origin(e[0])]
+        capped_text = [e for e in text_only if not _is_huggingface_origin(e[0])]
+        if not capped_text:
             kept.extend(with_image)
+            kept.extend(hf_text)
             continue
         # max_frac = text_kept / (with_image + text_kept)
         # → text_kept = max_frac * with_image / (1 - max_frac)
         if max_frac >= 1.0:
-            cap = len(text_only)
+            cap = len(capped_text)
         elif max_frac <= 0.0 or not with_image:
             cap = 0
         else:
             cap = int(max_frac * len(with_image) / (1 - max_frac))
-        kept_text = text_only[:cap]
+        kept_capped = capped_text[:cap]
         kept.extend(with_image)
-        kept.extend(kept_text)
-        dropped += len(text_only) - len(kept_text)
+        kept.extend(hf_text)
+        kept.extend(kept_capped)
+        dropped += len(capped_text) - len(kept_capped)
     return kept, dropped
 
 
@@ -322,6 +627,63 @@ def verify_labels(
             drops["satire_classified_news"] += 1
             continue
         kept.append((item, asserted))
+    return kept, drops
+
+
+# --- source balance ----------------------------------------------------------
+def enforce_source_balance(
+    verified: list[tuple[ProcessedItem, int]],
+    *,
+    max_frac: float = _MAX_SOURCE_FRAC,
+    seed: int,
+) -> tuple[list[tuple[ProcessedItem, int]], Counter]:
+    """Cap each source at ``max_frac`` of its label total via random subsample.
+
+    For every label, find any source whose share exceeds ``max_frac`` and
+    randomly downsample it to the cap. This is the post-collection
+    stratified-by-source step: we don't know up front how many items
+    each source will yield (download failures, dedup, language drops
+    all hit different feeds asymmetrically), so the cap has to apply
+    to the surviving population, not the targeted one.
+
+    Returns ``(kept, drops_per_source)`` where ``drops_per_source`` is a
+    counter keyed by the source domain so the summary stage can show
+    where the cap kicked in.
+    """
+    rng = random.Random(seed)
+    by_label: dict[int, list[tuple[ProcessedItem, int]]] = defaultdict(list)
+    for entry in verified:
+        by_label[entry[1]].append(entry)
+
+    kept: list[tuple[ProcessedItem, int]] = []
+    drops: Counter = Counter()
+    for label, group in by_label.items():
+        n = len(group)
+        if n == 0:
+            continue
+        cap = int(n * max_frac)
+        by_source: dict[str, list[tuple[ProcessedItem, int]]] = defaultdict(list)
+        for entry in group:
+            by_source[entry[0].source_domain or "<unknown>"].append(entry)
+        for source, entries in by_source.items():
+            if len(entries) <= cap or cap <= 0:
+                kept.extend(entries)
+                continue
+            shuffled = list(entries)
+            rng.shuffle(shuffled)
+            kept.extend(shuffled[:cap])
+            dropped = len(shuffled) - cap
+            drops[source] += dropped
+            logger.warning(
+                "source %s exceeds %.0f%% of label %s (%d / %d) — "
+                "downsampled to %d",
+                source,
+                max_frac * 100,
+                _LABEL_NAMES[label],
+                len(entries),
+                n,
+                cap,
+            )
     return kept, drops
 
 
@@ -375,6 +737,67 @@ def write_jsonl(records: list[dict[str, Any]], path: Path) -> None:
             fh.write(json.dumps(r, default=str) + "\n")
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _print_split_stats(name: str, split: list[dict[str, Any]]) -> None:
+    """Detailed per-split summary: labels, sources, text-only ratio, dates."""
+    n = len(split)
+    print(f"\n  --- {name} (total={n}) ---")
+    if n == 0:
+        return
+
+    labels = Counter(r["label"] for r in split)
+    label_breakdown = {_LABEL_NAMES[k]: v for k, v in labels.items()}
+    print(f"    labels: {label_breakdown}")
+
+    sources = Counter(r["source"] for r in split)
+    print(f"    sources ({len(sources)} unique):")
+    for source, count in sources.most_common(10):
+        pct = (count / n) * 100
+        marker = "  <-- exceeds cap" if pct > _MAX_SOURCE_FRAC * 100 else ""
+        print(f"      {source:40s} {count:5d}  {pct:5.1f}%{marker}")
+    if len(sources) > 10:
+        remainder = sum(c for _, c in sources.most_common()[10:])
+        print(f"      ({len(sources) - 10} more sources, total {remainder})")
+
+    text_only = sum(1 for r in split if not r.get("image_path"))
+    text_only_frac = (text_only / n) if n else 0.0
+    cap_marker = "" if text_only_frac <= _MAX_TEXT_ONLY_FRAC else "  <-- EXCEEDS CAP"
+    print(
+        f"    text-only: {text_only}/{n} = {text_only_frac:.1%}"
+        f"{cap_marker}  (max={_MAX_TEXT_ONLY_FRAC:.0%})"
+    )
+
+    text_lengths = [len(r.get("text") or "") for r in split]
+    avg_len = sum(text_lengths) / len(text_lengths) if text_lengths else 0.0
+    print(
+        f"    text length: avg={avg_len:5.0f} "
+        f"min={min(text_lengths) if text_lengths else 0} "
+        f"max={max(text_lengths) if text_lengths else 0}"
+    )
+
+    timestamps = [t for t in (_parse_timestamp(r.get("timestamp")) for r in split) if t]
+    if timestamps:
+        ts_min = min(timestamps)
+        ts_max = max(timestamps)
+        span_days = (ts_max - ts_min).days
+        print(
+            f"    date range: {ts_min.date()} → {ts_max.date()}  "
+            f"({span_days} day span, {len(timestamps)}/{n} dated)"
+        )
+    else:
+        print("    date range: (no parseable timestamps)")
+
+
 def print_stats(
     train: list[dict[str, Any]],
     val: list[dict[str, Any]],
@@ -382,14 +805,7 @@ def print_stats(
 ) -> None:
     print("\n=== Tier 1 dataset summary ===")
     for name, split in (("train", train), ("val", val), ("test", test)):
-        labels = Counter(r["label"] for r in split)
-        sources = Counter(r["source"] for r in split)
-        label_breakdown = {_LABEL_NAMES[k]: v for k, v in labels.items()}
-        top_sources = ", ".join(f"{s}={c}" for s, c in sources.most_common(5))
-        print(
-            f"  {name:5s}: total={len(split):5d} labels={label_breakdown} "
-            f"top_sources=[{top_sources}]"
-        )
+        _print_split_stats(name, split)
 
 
 # --- driver ------------------------------------------------------------------
@@ -400,6 +816,9 @@ async def run(args: argparse.Namespace) -> int:
     print(f"  output dir     : {args.output_dir}")
     print(f"  image storage  : {args.image_storage}")
     print(f"  use gdelt      : {args.use_gdelt}")
+    print(f"  use huggingface: {args.use_huggingface}")
+    print(f"  tier2 dir      : {args.tier2_dir} (exists={args.tier2_dir.exists()})")
+    print(f"  tier3 dir      : {args.tier3_dir} (exists={args.tier3_dir.exists()})")
     print(f"  dry run        : {args.dry_run}")
     print(f"  seed           : {args.seed}")
 
@@ -407,6 +826,9 @@ async def run(args: argparse.Namespace) -> int:
         args.target_news, use_gdelt=args.use_gdelt, dry_run=args.dry_run
     )
     satire_items = await scrape_satire(args.target_satire, args.dry_run)
+    hf_items: list[ScrapedItem] = []
+    if args.use_huggingface:
+        hf_items = await load_huggingface(args.hf_max_per_dataset, args.dry_run)
 
     if args.dry_run:
         print("\n[dry-run] no items written.")
@@ -414,8 +836,15 @@ async def run(args: argparse.Namespace) -> int:
 
     print(f"\n[scrape] news scraped  : {len(news_items)}")
     print(f"[scrape] satire scraped: {len(satire_items)}")
+    if args.use_huggingface:
+        hf_satire = sum(1 for it in hf_items if it.metadata.get("label") == "satire")
+        hf_news = len(hf_items) - hf_satire
+        print(
+            f"[hf]     loaded={len(hf_items)} "
+            f"(satire={hf_satire}, authentic={hf_news})"
+        )
 
-    all_items = news_items + satire_items
+    all_items = news_items + satire_items + hf_items
     processed, download_failures = await download_images(all_items, args.image_storage)
     text_only_count = sum(1 for p in processed if p.image_path is None)
     print(
@@ -424,14 +853,33 @@ async def run(args: argparse.Namespace) -> int:
         f"download_failures={download_failures}"
     )
 
+    filtered, quality_drops = quality_filter(processed)
+    print(f"[quality] kept={len(filtered)} drops={dict(quality_drops)}")
+
+    url_deduped, url_dropped = dedup_by_url(filtered)
+    print(f"[dedup-url] kept={len(url_deduped)} dropped={url_dropped}")
+
+    title_deduped, title_dropped = dedup_by_title(url_deduped)
+    print(f"[dedup-title] kept={len(title_deduped)} dropped={title_dropped}")
+
     deduper = ImageDownloader(storage_path=str(args.image_storage))
     try:
-        deduped = deduper.deduplicate_by_phash(processed)
+        deduped = deduper.deduplicate_by_phash(
+            title_deduped, hamming_threshold=_PHASH_HAMMING_THRESHOLD
+        )
     finally:
         await deduper.close()
-    print(f"[dedupe] kept={len(deduped)} dropped={len(processed) - len(deduped)}")
+    print(
+        f"[dedup-phash] kept={len(deduped)} "
+        f"dropped={len(title_deduped) - len(deduped)}"
+    )
 
-    verified, drops = verify_labels(deduped)
+    cross_kept, cross_dropped = drop_cross_tier(
+        deduped, args.tier2_dir, args.tier3_dir
+    )
+    print(f"[dedup-cross-tier] kept={len(cross_kept)} dropped={cross_dropped}")
+
+    verified, drops = verify_labels(cross_kept)
     print(f"[verify] kept={len(verified)} drops={dict(drops)}")
 
     capped, text_only_dropped = cap_text_only_per_label(verified)
@@ -439,13 +887,20 @@ async def run(args: argparse.Namespace) -> int:
     total_capped = len(capped)
     text_only_frac = (text_only_kept / total_capped) if total_capped else 0.0
     print(
-        f"[cap] text_only_kept={text_only_kept} "
+        f"[cap-text-only] text_only_kept={text_only_kept} "
         f"text_only_dropped={text_only_dropped} "
         f"text_only_frac={text_only_frac:.1%} "
         f"(max={_MAX_TEXT_ONLY_FRAC:.0%})"
     )
 
-    records = [to_record(item, label) for item, label in capped]
+    balanced, source_drops = enforce_source_balance(capped, seed=args.seed)
+    print(
+        f"[balance] kept={len(balanced)} "
+        f"dropped={sum(source_drops.values())} "
+        f"capped_sources={dict(source_drops) or '{}'}"
+    )
+
+    records = [to_record(item, label) for item, label in balanced]
     train, val, test = stratified_split(records, 0.8, 0.1, args.seed)
     print(f"[split] train={len(train)} val={len(val)} test={len(test)}")
 
