@@ -541,7 +541,13 @@ async def test_gdelt_scrape_topics_passes_filters_to_search() -> None:
 
     assert len(seen) == 1
     url = seen[0]
-    assert "timespan=3d" in url
+    # scrape_topics() now paginates through scrape() rather than calling
+    # search() directly, so the timespan is translated into an absolute
+    # startdatetime/enddatetime window instead of being passed as
+    # timespan=. The country/language filters still flow straight through.
+    assert "query=politics" in url
+    assert "startdatetime=" in url
+    assert "enddatetime=" in url
     assert "sourcecountry=GB" in url
     assert "sourcelang=english" in url
 
@@ -558,6 +564,21 @@ async def test_gdelt_default_queries_match_spec() -> None:
         "business",
         "international",
         "sports",
+        "education",
+        "entertainment",
+        "culture",
+        "energy",
+        "immigration",
+        "transportation",
+        "finance",
+        "law",
+        "military",
+        "agriculture",
+        "medicine",
+        "automotive",
+        "space",
+        "music",
+        "food",
     )
 
 
@@ -587,7 +608,9 @@ async def test_gdelt_falls_back_to_url_netloc_when_domain_missing() -> None:
         await scraper.close()
 
     assert len(items) == 1
-    assert items[0].source_domain == "www.example.org"
+    # With no "domain" field the source falls back to the URL's host, run
+    # through normalize_domain(), which lowercases and strips "www.".
+    assert items[0].source_domain == "example.org"
 
 
 # --- RSS news tests ---------------------------------------------------------
