@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Example archive-source config for: py scripts/build_tier1_dataset.py --use-archive --archive-config data/archive_sources.example.json",
+    "Each entry configures one ArchiveScraper. Only point this at sources you are AUTHORIZED to archive.",
+    "By default every source is checked for AI-scraping opt-out signals (robots.txt AI-crawler Disallow, or Content-Signal: ai-train=no) and SKIPPED if it has opted out. Set 'respect_optout': false ONLY with explicit authorization for that source.",
+    "These entries use placeholder example.com URLs and will simply find nothing — replace them with a permitted source.",
+    "type: one of sitemap_index | flat_sitemap | paginated",
+    "common keys: name, source_domain, label (satire|authentic), requests_per_second (default 1.0), max_pages (optional), respect_optout (default true)"
+  ],
+  "sources": [
+    {
+      "type": "sitemap_index",
+      "name": "example-sitemap-index",
+      "source_domain": "example.com",
+      "label": "satire",
+      "sitemap_url": "https://example.com/sitemap_index.xml",
+      "requests_per_second": 1.0,
+      "respect_optout": true
+    },
+    {
+      "type": "flat_sitemap",
+      "name": "example-flat-sitemap",
+      "source_domain": "example.com",
+      "label": "satire",
+      "sitemap_url": "https://example.com/sitemap.xml",
+      "page_size": 500,
+      "requests_per_second": 1.0,
+      "respect_optout": true
+    },
+    {
+      "type": "paginated",
+      "name": "example-paginated",
+      "source_domain": "example.com",
+      "label": "satire",
+      "listing_url_template": "https://example.com/page/{page}/",
+      "article_url_regex": "/[0-9]{4}/[0-9]{2}/",
+      "requests_per_second": 1.0,
+      "respect_optout": true
+    }
+  ]
+}

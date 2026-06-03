@@ -121,6 +121,23 @@ class BaseScraper(ABC):
             return None
         return response.text
 
+    async def fetch_bytes(
+        self, url: str, *, headers: dict[str, str] | None = None
+    ) -> bytes | None:
+        """Fetch ``url`` as raw, undecoded bytes with retry and rate limiting.
+
+        Like :meth:`fetch` but returns the response body without text
+        decoding — needed for binary payloads such as gzipped sitemaps
+        (``*.xml.gz``), whose bytes would be corrupted if run through
+        httpx's text decoder. Returns ``None`` on a robots block or after
+        every retry fails. Unlike :meth:`fetch_image` it does not assert a
+        content-type, since callers know what shape they asked for.
+        """
+        response = await self._request(url, headers=headers)
+        if response is None:
+            return None
+        return response.content
+
     async def fetch_image(
         self, url: str, *, headers: dict[str, str] | None = None
     ) -> bytes | None:

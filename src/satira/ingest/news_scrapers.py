@@ -258,11 +258,15 @@ class GDELTScraper(BaseScraper):
     DEFAULT_RATE_LIMIT_PER_MINUTE = 60  # GDELT allows ~1 req/sec.
 
     # Broad-topic queries tuned for diverse English-language coverage.
-    # Twenty topics × 500 records ≈ 10000 articles per scrape_topics()
-    # pass. The list was widened from ten to twenty for Tier 1 to push
-    # the imaged-content yield up — most query budgets in Tier 1 are
-    # bottlenecked on per-query pagination + dedup, so adding topics
-    # buys more *unique* articles than raising max_per_query alone.
+    # Twenty-five topics × 500 records ≈ 12500 articles per
+    # scrape_topics() pass. The list has been widened twice (10 → 20 →
+    # 25) for Tier 1 because most query budgets are bottlenecked on
+    # per-query pagination + dedup, so adding topics buys more
+    # *unique* articles than raising max_per_query alone. The most
+    # recent additions (medicine, automotive, space, music, food) were
+    # picked to cover domains that the previous 20-topic list missed:
+    # clinical-medical reporting (distinct from "health"-policy), auto
+    # industry, space/aerospace, arts-and-music, and food/cuisine.
     DEFAULT_QUERIES: tuple[str, ...] = (
         "politics",
         "economy",
@@ -284,6 +288,11 @@ class GDELTScraper(BaseScraper):
         "law",
         "military",
         "agriculture",
+        "medicine",
+        "automotive",
+        "space",
+        "music",
+        "food",
     )
 
     def __init__(self, **kwargs: Any) -> None:

@@ -148,27 +148,32 @@ def _adapt_biddls_onion(row: dict[str, Any]) -> ScrapedItem | None:
     )
 
 
+# All known HuggingFace satire datasets are intentionally disabled for
+# now. Every publicly-available HF satire corpus we evaluated is too
+# monocultural for V-L (vision-language) training:
+#
+#   * ``Biddls/Onion_News`` — 33k articles, 100% from The Onion, all
+#     text-only. Loading this corpus collapses the satire side of the
+#     dataset onto a single voice and a single visual prior (zero
+#     images), which directly contradicts what Tier 1 is meant to
+#     teach the model.
+#   * ``raquiba/Sarcasm_News_Headline`` — headlines-only (avg ~73
+#     chars), Onion vs HuffPost. Same single-publisher / text-only
+#     concern, plus malformed ``article_link`` values that produced
+#     the corrupt source ``huffingtonpost.comhttp:`` in past runs.
+#
+# The loader infrastructure (HFDatasetLoader, HFDatasetSpec, adapters)
+# is left intact so a better-distributed multimodal satire corpus can
+# be wired in by appending a spec here once one is found.
 KNOWN_SATIRE_DATASETS: tuple[HFDatasetSpec, ...] = (
-    # ``raquiba/Sarcasm_News_Headline`` (the "Onion-or-Not"-style
-    # Onion vs HuffPost headline corpus) is intentionally disabled.
-    # Two reasons:
-    #   1. It's headlines-only — average text length is ~73 chars,
-    #      well below the 300+ chars RSS/GDELT items carry. Mixing
-    #      both would let the model learn "short text == satire".
-    #   2. Several rows have malformed ``article_link`` values
-    #      (embedded second URL), which surfaced as the corrupt source
-    #      ``huffingtonpost.comhttp:`` in past Tier 1 runs.
-    # The adapter and spec are left in the source so the dataset can
-    # be re-enabled later if either issue gets addressed upstream.
-    #
     # HFDatasetSpec(
     #     dataset_id="raquiba/Sarcasm_News_Headline",
     #     adapter=_adapt_sarcasm_news_headline,
     # ),
-    HFDatasetSpec(
-        dataset_id="Biddls/Onion_News",
-        adapter=_adapt_biddls_onion,
-    ),
+    # HFDatasetSpec(
+    #     dataset_id="Biddls/Onion_News",
+    #     adapter=_adapt_biddls_onion,
+    # ),
 )
 
 

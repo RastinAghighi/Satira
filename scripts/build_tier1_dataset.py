@@ -79,6 +79,7 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from satira.ingest import (  # noqa: E402
+    ArchiveScraperRegistry,
     GDELTScraper,
     HFDatasetLoader,
     ImageDownloader,
@@ -95,11 +96,26 @@ from satira.ingest.source_credibility import NEWS, SATIRE  # noqa: E402
 logger = logging.getLogger("satira.build_tier1")
 
 
-# Topic queries used when ``--use-gdelt`` is set. Ten broad topics ×
-# 250 records per topic ≈ 2500 raw articles per run before
-# cross-query dedup; comfortably enough headroom for a 5000-item
-# news target once RSS contributions are added in.
+# Topic queries used when ``--use-gdelt`` is set. Twenty-five broad
+# topics × 500 records per topic ≈ 12500 raw articles per pass before
+# cross-query dedup. With the dual-pass timespan strategy
+# (``1d`` + a wider window such as ``7d``) this comfortably exceeds
+# any realistic Tier 1 news target once RSS contributions are added in.
 DEFAULT_GDELT_QUERIES: tuple[str, ...] = GDELTScraper.DEFAULT_QUERIES
+
+# Records to request per GDELT query per pass. GDELT caps a single API
+# call at 250, so 500 forces the paginating cursor in
+# :meth:`GDELTScraper.scrape` to make two calls per query — twice the
+# unique articles per topic without raising the topic count further.
+_GDELT_MAX_PER_QUERY = 500
+
+# Cap on the user-supplied ``--gdelt-timespan`` value. GDELT will
+# happily accept much wider windows but a 30-day cap keeps Tier 1's
+# temporal mix recent enough that the model isn't training on stale
+# news cycles, and bounds the worst-case API call count.
+_GDELT_MAX_TIMESPAN_DAYS = 30
+_GDELT_TIMESPAN_RE = re.compile(r"^\s*(\d+)\s*([hdw])\s*$", re.IGNORECASE)
+_GDELT_TIMESPAN_HOURS: dict[str, int] = {"h": 1, "d": 24, "w": 24 * 7}
 
 # Some feeds (NPR, Al Jazeera) don't carry images in their RSS, so the
 # items they contribute are necessarily text-only. We keep them — a
@@ -150,6 +166,33 @@ _DOWNLOAD_BATCH = 50
 _MAX_CONCURRENT_DOWNLOADS = 10
 
 
+def _gdelt_timespan(value: str) -> str:
+    """argparse type-validator for ``--gdelt-timespan``.
+
+    Accepts GDELT-style ``<N><unit>`` strings where unit is ``h``/``d``/``w``
+    and the resulting window is ≤ :data:`_GDELT_MAX_TIMESPAN_DAYS` days.
+    Returns the canonicalized lowercase string.
+    """
+    match = _GDELT_TIMESPAN_RE.match(value or "")
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid GDELT timespan {value!r}; expected forms like '1d', '7d', '12h', '2w'"
+        )
+    n = int(match.group(1))
+    unit = match.group(2).lower()
+    if n <= 0:
+        raise argparse.ArgumentTypeError(
+            f"GDELT timespan must be positive (got {value!r})"
+        )
+    hours = n * _GDELT_TIMESPAN_HOURS[unit]
+    if hours > _GDELT_MAX_TIMESPAN_DAYS * 24:
+        raise argparse.ArgumentTypeError(
+            f"GDELT timespan {value!r} exceeds max of "
+            f"{_GDELT_MAX_TIMESPAN_DAYS}d"
+        )
+    return f"{n}{unit}"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the Tier 1 (easy baseline) Satira dataset."
@@ -183,16 +226,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Augment the RSS feeds with GDELT topic-based scraping "
-            "(adds ~2500 candidate articles across 10 broad topics)."
+            "(25 topics, 500 records each, run for both timespan=1d "
+            "and --gdelt-timespan)."
+        ),
+    )
+    parser.add_argument(
+        "--gdelt-timespan",
+        type=_gdelt_timespan,
+        default="7d",
+        help=(
+            "Wider GDELT window run alongside the default 1d pass to "
+            "expand temporal coverage. Accepts GDELT-style strings "
+            "like '7d', '12h', '2w'. Capped at 30d (default: 7d)."
         ),
     )
     parser.add_argument(
         "--use-huggingface",
         action="store_true",
         help=(
-            "Augment the dataset with pre-labeled rows from curated "
-            "HuggingFace satire/news datasets (text-only). Combined with "
-            "--use-gdelt this typically yields 5000-10000 Tier 1 items."
+            "Currently a no-op: all curated HuggingFace satire datasets "
+            "have been disabled because the only available corpus "
+            "(Onion_News) is single-publisher and text-only, which "
+            "skews Tier 1's V-L training. The flag is preserved so "
+            "callers don't break; passing it logs a warning."
         ),
     )
     parser.add_argument(
@@ -200,6 +256,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=3000,
         help="Max rows to pull from each HuggingFace dataset (default: 3000).",
+    )
+    parser.add_argument(
+        "--use-archive",
+        action="store_true",
+        help=(
+            "Enable the paginated archive scrapers (ArchiveScraperRegistry) "
+            "for deep-history satire beyond the RSS recency window. Requires "
+            "--archive-config naming *permitted* sources; archive scrapers "
+            "refuse any source that opts out of AI scraping (robots.txt "
+            "AI-crawler Disallow or Content-Signal: ai-train=no). See "
+            "src/satira/ingest/archive_scrapers.py."
+        ),
+    )
+    parser.add_argument(
+        "--archive-config",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a JSON file listing permitted archive sources: a list "
+            "of scraper config dicts (or {\"sources\": [...]}). Each needs "
+            "'type' (sitemap_index|flat_sitemap|paginated), 'name', "
+            "'source_domain', and a type-specific URL. Required for "
+            "--use-archive to scrape anything."
+        ),
+    )
+    parser.add_argument(
+        "--archive-max-articles",
+        type=int,
+        default=2000,
+        help="Max articles to pull per archive source (default: 2000).",
+    )
+    parser.add_argument(
+        "--archive-resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Resume each archive source from its saved state in "
+            "./data/scraper_state (default: True). Use --no-archive-resume "
+            "or --archive-fresh to start over."
+        ),
+    )
+    parser.add_argument(
+        "--archive-fresh",
+        action="store_true",
+        help=(
+            "Ignore saved archive state and restart each source from page 1 "
+            "(default: False). Overrides --archive-resume."
+        ),
+    )
+    parser.add_argument(
+        "--archive-dry-run",
+        action="store_true",
+        help=(
+            "Archive smoke test: scrape only 50 articles per source to verify "
+            "the scrapers work before committing to a full multi-hour run."
+        ),
     )
     parser.add_argument(
         "--tier2-dir",
@@ -249,7 +361,11 @@ def setup_logging(level: str) -> None:
 
 # --- scraping ----------------------------------------------------------------
 async def scrape_news(
-    target: int, *, use_gdelt: bool, dry_run: bool
+    target: int,
+    *,
+    use_gdelt: bool,
+    gdelt_timespan: str,
+    dry_run: bool,
 ) -> list[ScrapedItem]:
     if dry_run:
         print(f"[dry-run] news: would scrape up to {target} items")
@@ -260,23 +376,81 @@ async def scrape_news(
             print("[dry-run] news: GDELT topic queries:")
             for q in DEFAULT_GDELT_QUERIES:
                 print(f"             - {q}")
+            timespans = ["1d"]
+            if gdelt_timespan != "1d":
+                timespans.append(gdelt_timespan)
+            print(
+                f"[dry-run] news: GDELT passes: {timespans}, "
+                f"{_GDELT_MAX_PER_QUERY} records/query"
+            )
         else:
             print("[dry-run] news: GDELT disabled (pass --use-gdelt to enable)")
         return []
 
-    gdelt_queries = list(DEFAULT_GDELT_QUERIES) if use_gdelt else None
-
     items: list[ScrapedItem] = []
+    seen_urls: set[str] = set()
+
+    def _accept(item: ScrapedItem) -> bool:
+        key = (item.source_url or "").strip().lower().rstrip("/")
+        if key:
+            if key in seen_urls:
+                return False
+            seen_urls.add(key)
+        return True
+
     async with NewsScraperRegistry() as registry:
         bar = tqdm(total=target, desc="news scrape", unit="item")
-        async for item in registry.scrape_all(
-            gdelt_queries=gdelt_queries,
-            max_items=target,
-        ):
-            items.append(item)
-            bar.update(1)
+
+        # 1. RSS first — cheap, reliable, and image-bearing.
+        try:
+            async for item in registry.rss_scraper.scrape():
+                if not _accept(item):
+                    continue
+                items.append(item)
+                bar.update(1)
+                if len(items) >= target:
+                    bar.close()
+                    return items
+        except Exception as exc:  # noqa: BLE001 — one source can't kill the run
+            logger.exception("RSSNewsScraper failed mid-run: %s", exc)
+
+        if not use_gdelt:
+            bar.close()
+            return items
+
+        # 2. GDELT — run twice for breadth: a fresh "today" pass plus a
+        #    wider window (default 7d) so the dataset isn't dominated by
+        #    whatever single news cycle happened to be running. Skip the
+        #    second pass when the user pinned the wide window to "1d".
+        gdelt_passes = ["1d"]
+        if gdelt_timespan != "1d":
+            gdelt_passes.append(gdelt_timespan)
+
+        for timespan in gdelt_passes:
             if len(items) >= target:
                 break
+            logger.info(
+                "GDELT pass: timespan=%s queries=%d max_per_query=%d",
+                timespan,
+                len(DEFAULT_GDELT_QUERIES),
+                _GDELT_MAX_PER_QUERY,
+            )
+            try:
+                async for item in registry.gdelt_scraper.scrape_topics(
+                    queries=list(DEFAULT_GDELT_QUERIES),
+                    max_per_query=_GDELT_MAX_PER_QUERY,
+                    timespan=timespan,
+                ):
+                    if not _accept(item):
+                        continue
+                    items.append(item)
+                    bar.update(1)
+                    if len(items) >= target:
+                        break
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "GDELT scrape_topics (timespan=%s) failed: %s", timespan, exc
+                )
         bar.close()
     return items
 
@@ -304,10 +478,120 @@ async def scrape_satire(target: int, dry_run: bool) -> list[ScrapedItem]:
     return items
 
 
+# --- archive scraping --------------------------------------------------------
+def _load_archive_configs(path: Path | None) -> list[dict[str, Any]]:
+    """Read the archive-source config JSON into a list of scraper dicts.
+
+    Accepts either a bare JSON list or a ``{"sources": [...]}`` wrapper.
+    Returns ``[]`` (with a logged error) on any read/parse problem so a
+    bad config file degrades to "no archive sources" rather than aborting
+    the whole Tier 1 build.
+    """
+    if path is None:
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("could not read archive config %s: %s", path, exc)
+        return []
+    if isinstance(data, dict):
+        data = data.get("sources", [])
+    if not isinstance(data, list):
+        logger.error(
+            "archive config %s must be a JSON list (or {\"sources\": [...]})", path
+        )
+        return []
+    return data
+
+
+async def scrape_archive(
+    *,
+    config_path: Path | None,
+    max_articles: int,
+    resume: bool,
+    dry_run: bool,
+) -> list[ScrapedItem]:
+    """Scrape configured archive sources for deep-history imaged satire.
+
+    Returns an empty list when no permitted sources are configured (the
+    default) — the registry self-reports that case. Archive items already
+    carry an ``image_url`` (the scrapers skip image-less articles), so
+    they flow through the same download/filter/dedup pipeline as the RSS
+    and GDELT items.
+    """
+    configs = _load_archive_configs(config_path)
+
+    if dry_run:
+        print(
+            f"[dry-run] archive: would scrape up to {max_articles} articles/source "
+            f"(resume={resume})"
+        )
+        if not configs:
+            print(
+                "[dry-run] archive: no sources configured. Pass --archive-config "
+                "with permitted sources. Archive scrapers REFUSE sources that opt "
+                "out of AI scraping (robots AI-crawler Disallow / ai-train=no)."
+            )
+        else:
+            print("[dry-run] archive: configured sources:")
+            for c in configs:
+                entry = c.get("sitemap_url") or c.get("listing_url_template") or ""
+                print(
+                    f"             - {c.get('name', '?')} "
+                    f"[{c.get('type', '?')}] {entry}"
+                )
+        return []
+
+    registry = ArchiveScraperRegistry.from_config(configs)
+    if not registry.scrapers:
+        logger.warning(
+            "--use-archive was set but no valid archive sources are configured "
+            "(see --archive-config); contributing 0 archive items."
+        )
+        return []
+
+    items: list[ScrapedItem] = []
+    async with registry:
+        bar = tqdm(
+            total=max_articles * len(registry.scrapers),
+            desc="archive scrape",
+            unit="item",
+        )
+        async for item in registry.scrape_all(
+            max_articles_per_source=max_articles, resume=resume
+        ):
+            items.append(item)
+            bar.update(1)
+        bar.close()
+    return items
+
+
 # --- huggingface -------------------------------------------------------------
 async def load_huggingface(
     max_per_dataset: int, dry_run: bool
 ) -> list[ScrapedItem]:
+    """Load curated HuggingFace satire/news datasets — currently disabled.
+
+    All entries in :data:`KNOWN_SATIRE_DATASETS` are commented out
+    because the only available HF satire corpus
+    (``Biddls/Onion_News``) is a single-publisher text-only corpus
+    that skews V-L training. The function and ``--use-huggingface``
+    flag are kept in place so callers/scripts don't break; instead
+    a loud warning is logged and an empty list is returned.
+    """
+    if not KNOWN_SATIRE_DATASETS:
+        logger.warning(
+            "--use-huggingface was passed but all HuggingFace satire "
+            "datasets are currently disabled (single-publisher / "
+            "text-only monoculture). Returning 0 items. See "
+            "src/satira/ingest/huggingface_loader.py for context."
+        )
+        if dry_run:
+            print(
+                "[dry-run] huggingface: disabled — no datasets configured"
+            )
+        return []
+
     if dry_run:
         print(
             f"[dry-run] huggingface: would load up to {max_per_dataset} rows "
@@ -547,15 +831,11 @@ def drop_cross_tier(
 
 
 # --- label verification ------------------------------------------------------
-def _is_huggingface_origin(item: ProcessedItem) -> bool:
-    return (item.metadata or {}).get("source_type") == "huggingface"
-
-
 def cap_text_only_per_label(
     verified: list[tuple[ProcessedItem, int]],
     max_frac: float = _MAX_TEXT_ONLY_FRAC,
 ) -> tuple[list[tuple[ProcessedItem, int]], int]:
-    """Cap *scraped* text-only items at ``max_frac`` of each label's total.
+    """Cap text-only items at ``max_frac`` of each label's total.
 
     NPR and Al Jazeera publish RSS without images, so their entries
     arrive here as text-only items. Without a cap they can dominate the
@@ -564,10 +844,13 @@ def cap_text_only_per_label(
     mix. We cap *per label* so satire and news bins are balanced
     independently.
 
-    Items sourced from curated HuggingFace datasets are *exempt* from
-    the cap and pass through untouched: they are intentionally
-    text-only, large in volume, and the original RSS-feed concern
-    (missing thumbnails on a few outlets) doesn't apply to them.
+    The cap applies uniformly regardless of source. An earlier version
+    exempted curated HuggingFace rows on the grounds that they were
+    intentionally text-only and high-volume, but in practice the only
+    available HF satire corpus (Onion_News, 33k Onion-only rows)
+    skewed the dataset hard toward a single-publisher text-only
+    monoculture. If HF datasets are ever re-enabled they should be
+    subject to the same cap as RSS/GDELT.
 
     Returns ``(kept, dropped_count)``. Items are dropped from the tail
     of the text-only list so the cap is deterministic for a given input
@@ -582,25 +865,21 @@ def cap_text_only_per_label(
     for label, group in by_label.items():
         with_image = [e for e in group if e[0].image_path is not None]
         text_only = [e for e in group if e[0].image_path is None]
-        hf_text = [e for e in text_only if _is_huggingface_origin(e[0])]
-        capped_text = [e for e in text_only if not _is_huggingface_origin(e[0])]
-        if not capped_text:
+        if not text_only:
             kept.extend(with_image)
-            kept.extend(hf_text)
             continue
         # max_frac = text_kept / (with_image + text_kept)
         # → text_kept = max_frac * with_image / (1 - max_frac)
         if max_frac >= 1.0:
-            cap = len(capped_text)
+            cap = len(text_only)
         elif max_frac <= 0.0 or not with_image:
             cap = 0
         else:
             cap = int(max_frac * len(with_image) / (1 - max_frac))
-        kept_capped = capped_text[:cap]
+        kept_text = text_only[:cap]
         kept.extend(with_image)
-        kept.extend(hf_text)
-        kept.extend(kept_capped)
-        dropped += len(capped_text) - len(kept_capped)
+        kept.extend(kept_text)
+        dropped += len(text_only) - len(kept_text)
     return kept, dropped
 
 
@@ -856,19 +1135,40 @@ async def run(args: argparse.Namespace) -> int:
     print(f"  output dir     : {args.output_dir}")
     print(f"  image storage  : {args.image_storage}")
     print(f"  use gdelt      : {args.use_gdelt}")
+    print(f"  gdelt timespan : {args.gdelt_timespan}")
     print(f"  use huggingface: {args.use_huggingface}")
+    print(f"  use archive    : {args.use_archive}")
+    if args.use_archive:
+        archive_resume = args.archive_resume and not args.archive_fresh
+        print(f"  archive config : {args.archive_config}")
+        print(
+            f"  archive limits : max_articles={args.archive_max_articles} "
+            f"resume={archive_resume} dry_run={args.archive_dry_run}"
+        )
     print(f"  tier2 dir      : {args.tier2_dir} (exists={args.tier2_dir.exists()})")
     print(f"  tier3 dir      : {args.tier3_dir} (exists={args.tier3_dir.exists()})")
     print(f"  dry run        : {args.dry_run}")
     print(f"  seed           : {args.seed}")
 
     news_items = await scrape_news(
-        args.target_news, use_gdelt=args.use_gdelt, dry_run=args.dry_run
+        args.target_news,
+        use_gdelt=args.use_gdelt,
+        gdelt_timespan=args.gdelt_timespan,
+        dry_run=args.dry_run,
     )
     satire_items = await scrape_satire(args.target_satire, args.dry_run)
     hf_items: list[ScrapedItem] = []
     if args.use_huggingface:
         hf_items = await load_huggingface(args.hf_max_per_dataset, args.dry_run)
+
+    archive_items: list[ScrapedItem] = []
+    if args.use_archive:
+        archive_items = await scrape_archive(
+            config_path=args.archive_config,
+            max_articles=(50 if args.archive_dry_run else args.archive_max_articles),
+            resume=(args.archive_resume and not args.archive_fresh),
+            dry_run=args.dry_run,
+        )
 
     if args.dry_run:
         print("\n[dry-run] no items written.")
@@ -876,6 +1176,8 @@ async def run(args: argparse.Namespace) -> int:
 
     print(f"\n[scrape] news scraped  : {len(news_items)}")
     print(f"[scrape] satire scraped: {len(satire_items)}")
+    if args.use_archive:
+        print(f"[scrape] archive scraped: {len(archive_items)}")
     if args.use_huggingface:
         hf_satire = sum(1 for it in hf_items if it.metadata.get("label") == "satire")
         hf_news = len(hf_items) - hf_satire
@@ -884,7 +1186,7 @@ async def run(args: argparse.Namespace) -> int:
             f"(satire={hf_satire}, authentic={hf_news})"
         )
 
-    all_items = news_items + satire_items + hf_items
+    all_items = news_items + satire_items + hf_items + archive_items
     processed, download_failures = await download_images(all_items, args.image_storage)
     text_only_count = sum(1 for p in processed if p.image_path is None)
     print(
