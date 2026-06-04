@@ -1,5 +1,6 @@
 """Data ingestion package: scrapers and source adapters."""
 
+from satira.ingest.accumulator import CollectionReport, CorpusAccumulator
 from satira.ingest.archive_scrapers import (
     AIOptOutVerdict,
     ArchiveScraper,
@@ -45,6 +46,8 @@ __all__ = [
     "ArchiveScraperState",
     "BabylonBeeScraper",
     "BaseScraper",
+    "CollectionReport",
+    "CorpusAccumulator",
     "EntityExtractor",
     "ExtractedEntity",
     "FlatSitemapArchiveScraper",
