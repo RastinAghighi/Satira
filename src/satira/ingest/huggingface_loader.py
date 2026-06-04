@@ -25,11 +25,22 @@ Each row is mapped to a :class:`ScrapedItem` with:
   the publisher hardcoded for the dataset (e.g. ``theonion.com`` for the
   Onion-only corpora). This lets :class:`SourceCredibilityClassifier`
   hit its known-source allowlists for these rows.
-* ``metadata['label']`` — Satira's string label (``"satire"`` or
-  ``"authentic"``), matching what the RSS scrapers stamp.
+* ``metadata['label']`` — Satira's string label. The binary satire
+  corpora stamp ``"satire"`` / ``"authentic"``; the fact-checking
+  corpora (:data:`KNOWN_FACTCHECK_DATASETS`) map their veracity scales
+  onto the full 5-class taxonomy, adding ``"fabricated"`` and
+  ``"misleading_context"``.
 * ``metadata['source_type'] = 'huggingface'`` and
   ``metadata['hf_dataset']`` — provenance markers used by the cap step
   and by anyone debugging dataset composition later.
+* ``metadata['license']`` / ``metadata['citation']`` (fact-checking
+  corpora) — the verified license and a credit string so the model card
+  can attribute every dataset.
+
+Licensing: a dataset only earns a spec here once its license has been
+verified as research-permissive. Datasets with unknown/unclear or
+commercial-restricted licenses are deliberately left out (see the note
+above :data:`KNOWN_FACTCHECK_DATASETS`).
 """
 from __future__ import annotations
 
@@ -50,6 +61,19 @@ logger = logging.getLogger(__name__)
 _LABEL_AUTHENTIC = "authentic"
 _LABEL_SATIRE = "satire"
 
+# Satira's full 5-class taxonomy, mirroring settings.CLASS_NAMES
+# (authentic=0, satire=1, parody=2, misleading_context=3, fabricated=4).
+# The binary satire scrapers only ever emit the first two; fact-checking
+# datasets below map their veracity scales onto the misinformation
+# classes (fabricated / misleading_context).
+_LABEL_PARODY = "parody"
+_LABEL_MISLEADING = "misleading_context"
+_LABEL_FABRICATED = "fabricated"
+
+_FIVE_CLASS = frozenset(
+    {_LABEL_AUTHENTIC, _LABEL_SATIRE, _LABEL_PARODY, _LABEL_MISLEADING, _LABEL_FABRICATED}
+)
+
 # Header/body separator used by the Onion_News corpus.
 _ONION_SEP = "#~#"
 
@@ -65,12 +89,21 @@ class HFDatasetSpec:
     ``default_split`` and ``config`` give per-dataset overrides for the
     HF ``load_dataset`` call so callers don't need to remember each
     dataset's quirks.
+
+    ``license`` and ``citation`` record the dataset's verified license
+    SPDX/short string and a credit string for the model card. They live
+    on the spec (not just inside each item's metadata) so a loader can
+    refuse to load anything whose license hasn't been pinned, and so the
+    reporting tooling can attribute every source. Only research-licensed
+    datasets should ever get a spec here.
     """
 
     dataset_id: str
     adapter: Callable[[dict[str, Any]], ScrapedItem | None]
     default_split: str = "train"
     config: str | None = None
+    license: str = ""
+    citation: str = ""
 
 
 # --- adapters ---------------------------------------------------------------
@@ -148,6 +181,92 @@ def _adapt_biddls_onion(row: dict[str, Any]) -> ScrapedItem | None:
     )
 
 
+# --- LIAR2 (fact-checked political statements) ------------------------------
+# Citation for the model card. LIAR2 (apache-2.0) extends the original
+# LIAR corpus (Wang, 2017).
+_LIAR2_CITATION = (
+    "Xu, C., & Kechadi, M-T. (2024). An Enhanced Fake News Detection System "
+    "With Fuzzy Deep Learning. IEEE Access, 12, 88006-88021. "
+    "doi:10.1109/ACCESS.2024.3418340. Extends LIAR (Wang, 2017, ACL P17-2067)."
+)
+
+# LIAR2's integer ``label`` -> PolitiFact category, per the chengxuphd/LIAR2
+# GitHub legend and confirmed against sample rows (0 = most false … 5 = true).
+_LIAR2_LABEL_NAMES: dict[int, str] = {
+    0: "pants-fire",
+    1: "false",
+    2: "barely-true",
+    3: "half-true",
+    4: "mostly-true",
+    5: "true",
+}
+
+# PolitiFact category -> Satira's 5-class taxonomy. Edit this table to
+# retune the mapping; it is deliberately the single source of truth.
+#
+# LIAR2 deliberately contributes NOTHING to the satire class, and that is
+# correct: LIAR2 is political fact-checking data — every row is a
+# real-world claim rated for veracity — and it contains no actual satire.
+# "Pants on fire" is egregiously *false* political speech, not intentional
+# humour, so it maps to ``fabricated``, not ``satire``. Treating political
+# falsehood as satire would be a category error that poisons the satire
+# class. LIAR2 therefore only strengthens the fabricated /
+# misleading_context / authentic classes. The veracity scale collapses as:
+#   pants-fire, false      -> fabricated          (egregious / outright falsehood)
+#   barely-true, half-true -> misleading_context  (some truth, omits critical facts)
+#   mostly-true, true      -> authentic           (substantially accurate)
+_LIAR2_TO_SATIRA: dict[str, str] = {
+    "pants-fire": _LABEL_FABRICATED,
+    "false": _LABEL_FABRICATED,
+    "barely-true": _LABEL_MISLEADING,
+    "half-true": _LABEL_MISLEADING,
+    "mostly-true": _LABEL_AUTHENTIC,
+    "true": _LABEL_AUTHENTIC,
+}
+
+
+def _adapt_liar2(row: dict[str, Any]) -> ScrapedItem | None:
+    """chengxuphd/liar2: ~23k PolitiFact-checked statements (apache-2.0).
+
+    Columns: ``statement`` (the claim), ``label`` (int 0-5), ``context``,
+    ``speaker``, ``subject``, ``date``, ``justification``. The 6-way
+    veracity scale is mapped to Satira's 5-class taxonomy via
+    :data:`_LIAR2_TO_SATIRA`. Text-only.
+
+    ``justification`` is intentionally NOT copied into the item — it is
+    the fact-checker's reasoning and would leak the label into the model
+    input. ``context`` (the venue of the claim, e.g. "a tweet") is safe.
+    """
+    statement = (row.get("statement") or "").strip()
+    if not statement:
+        return None
+    original = _LIAR2_LABEL_NAMES.get(row.get("label"))
+    if original is None:
+        return None
+    label = _LIAR2_TO_SATIRA[original]
+
+    return ScrapedItem(
+        source_url="",
+        image_url=None,
+        title=statement,
+        text=(row.get("context") or "").strip(),
+        timestamp=_now_utc(),
+        # All LIAR2 verdicts come from PolitiFact; tagging the fact-checker
+        # as the source groups the corpus under one source for the
+        # source-balance cap and records provenance.
+        source_domain="politifact.com",
+        metadata={
+            "label": label,
+            "original_label": original,
+            "source_type": "huggingface",
+            "hf_dataset": "chengxuphd/liar2",
+            "license": "apache-2.0",
+            "citation": _LIAR2_CITATION,
+            "speaker": (row.get("speaker") or "").strip(),
+        },
+    )
+
+
 # All known HuggingFace satire datasets are intentionally disabled for
 # now. Every publicly-available HF satire corpus we evaluated is too
 # monocultural for V-L (vision-language) training:
@@ -174,6 +293,32 @@ KNOWN_SATIRE_DATASETS: tuple[HFDatasetSpec, ...] = (
     #     dataset_id="Biddls/Onion_News",
     #     adapter=_adapt_biddls_onion,
     # ),
+)
+
+
+# Research-licensed fact-checking corpora, mapped onto the 5-class
+# taxonomy's misinformation labels (fabricated / misleading_context) plus
+# satire/authentic. These are TEXT-ONLY and feed the multi-class tiers,
+# not the binary Tier 1 build.
+#
+# Only datasets whose license was verified as research-permissive are
+# listed. Two requested datasets were deliberately excluded:
+#   * MultiFC — the HF mirror (pszemraj/multi_fc) states "License is
+#     currently unknown"; the canonical mirror (mteb/multi-fc) is gated
+#     (401). Unverifiable license -> skipped.
+#   * FakeNewsNet (multimodal) — the only image+text candidate
+#     (Ahren09/MMSoc_PolitiFact) declares no license (the underlying news
+#     images carry third-party copyright); apache-2.0 mirrors are
+#     text-only, so none satisfies "research-licensed AND multimodal".
+#     Licensed imaged data should come through the archive_scrapers
+#     framework pointed at a permitted source, not a scraped re-host.
+KNOWN_FACTCHECK_DATASETS: tuple[HFDatasetSpec, ...] = (
+    HFDatasetSpec(
+        dataset_id="chengxuphd/liar2",
+        adapter=_adapt_liar2,
+        license="apache-2.0",
+        citation=_LIAR2_CITATION,
+    ),
 )
 
 

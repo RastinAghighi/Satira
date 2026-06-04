@@ -14,6 +14,7 @@ from satira.ingest.archive_scrapers import (
 from satira.ingest.base_scraper import BaseScraper, ScrapedItem, ScraperStats
 from satira.ingest.entity_extraction import EntityExtractor, ExtractedEntity
 from satira.ingest.huggingface_loader import (
+    KNOWN_FACTCHECK_DATASETS,
     KNOWN_SATIRE_DATASETS,
     HFDatasetLoader,
     HFDatasetSpec,
@@ -51,6 +52,7 @@ __all__ = [
     "HFDatasetLoader",
     "HFDatasetSpec",
     "ImageDownloader",
+    "KNOWN_FACTCHECK_DATASETS",
     "KNOWN_NEWS",
     "KNOWN_SATIRE",
     "KNOWN_SATIRE_DATASETS",
