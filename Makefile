@@ -25,7 +25,7 @@ typecheck:
 	poetry run mypy src/satira
 
 run-api:
-	poetry run uvicorn satira.api:app --reload --host 0.0.0.0 --port 8000
+	poetry run uvicorn satira.api.app:app --reload --host 0.0.0.0 --port 8000
 
 docker-up:
 	docker compose up -d
