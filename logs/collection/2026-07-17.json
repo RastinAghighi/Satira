@@ -1,0 +1,18 @@
+{
+  "run_date": "2026-07-17T07:00:06.243976+00:00",
+  "items_scraped": 200,
+  "items_new": 47,
+  "items_duplicate": 153,
+  "images_downloaded": 37,
+  "by_source": {
+    "bbc.co.uk": 21,
+    "npr.org": 3,
+    "aljazeera.com": 10,
+    "nytimes.com": 3,
+    "theguardian.com": 10
+  },
+  "by_label": {
+    "authentic": 47
+  },
+  "errors": []
+}
