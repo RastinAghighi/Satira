@@ -76,6 +76,7 @@ class CurriculumDataLoader:
         tier3: SatireDataset,
         scheduler: CurriculumScheduler,
         batch_size: int = 64,
+        collate_fn: Optional[Callable[[list[dict]], dict]] = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -86,6 +87,10 @@ class CurriculumDataLoader:
         }
         self.scheduler = scheduler
         self.batch_size = batch_size
+        # When set, per-item dicts are handed to this collate (e.g. the cached
+        # embedding collate) instead of the default image-stacking path. The
+        # "tier" provenance list is attached to whatever it returns.
+        self.collate_fn = collate_fn
 
     def _tier_counts(self, weights: dict[str, float]) -> dict[str, int]:
         counts = {k: int(round(weights[k] * self.batch_size)) for k in self.TIER_KEYS}
@@ -112,6 +117,11 @@ class CurriculumDataLoader:
             for idx in indices:
                 samples.append(dataset[idx])
                 tier_labels.append(tier_name)
+
+        if self.collate_fn is not None:
+            batch = self.collate_fn(samples)
+            batch["tier"] = tier_labels
+            return batch
 
         images = torch.stack([s["image"] for s in samples])
         texts = [s["text"] for s in samples]

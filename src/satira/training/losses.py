@@ -33,6 +33,44 @@ def focal_loss(
     return loss.mean()
 
 
+def class_weights_from_counts(
+    counts: dict[int, int],
+    num_classes: int,
+    *,
+    scheme: str = "uniform",
+    eps: float = 1.0,
+) -> torch.Tensor:
+    """Per-class loss weights derived from training-split counts.
+
+    ``scheme="uniform"`` (this run's default) returns all-ones. ``scheme=
+    "inverse_frequency"`` returns ``total / (num_classes * (count + eps))``,
+    normalized to mean 1. The ``eps`` floor on the denominator means a class with
+    zero training examples can never divide by zero — it just receives a large,
+    finite weight (moot in practice, since it contributes no samples to the loss).
+
+    Returns a ``(num_classes,)`` float tensor.
+    """
+    if scheme == "uniform":
+        return torch.ones(num_classes, dtype=torch.float32)
+    if scheme != "inverse_frequency":
+        raise ValueError(
+            f"unknown class-weight scheme {scheme!r}; "
+            "expected 'uniform' or 'inverse_frequency'"
+        )
+    if eps <= 0:
+        raise ValueError(f"eps must be positive to guard the denominator, got {eps}")
+
+    counts_t = torch.tensor(
+        [float(counts.get(c, 0)) for c in range(num_classes)], dtype=torch.float32
+    )
+    total = float(counts_t.sum().item())
+    if total <= 0:
+        return torch.ones(num_classes, dtype=torch.float32)
+    weights = total / (num_classes * (counts_t + eps))
+    # Normalize to mean 1 so the overall loss scale is independent of the scheme.
+    return weights * (num_classes / float(weights.sum().item()))
+
+
 def per_sample_gate_activation(
     t_gate: torch.Tensor,
     v_gate: torch.Tensor,

@@ -25,6 +25,11 @@ checkpoints/
 wandb/
 mlruns/
 
+# Precomputed embedding cache and generated run artifacts
+data/embeddings/
+data/corpus/splits_*.json
+runs/
+
 # IDE
 .idea/
 .vscode/

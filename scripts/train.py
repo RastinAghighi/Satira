@@ -26,11 +26,22 @@ SRC_PATH = REPO_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
+from collections import Counter  # noqa: E402
+
 from satira import __version__ as SATIRA_VERSION  # noqa: E402
 from satira.config import Settings  # noqa: E402
-from satira.data.datasets import SatireDataset, create_mock_datasets  # noqa: E402
+from satira.data.corpus_dataset import (  # noqa: E402
+    DEFAULT_EMBEDDING_DIR,
+    CorpusEmbeddingDataset,
+    assign_splits,
+    collate_embeddings,
+    load_corpus_items,
+    print_split_summary,
+    split_items,
+)
+from satira.data.datasets import create_mock_datasets  # noqa: E402
 from satira.models.engine import SatireDetectionEngine  # noqa: E402
-from satira.training.evaluation import ModelEvaluator  # noqa: E402
+from satira.training.losses import class_weights_from_counts  # noqa: E402
 from satira.training.trainer import SatireTrainer  # noqa: E402
 
 
@@ -94,6 +105,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=42,
         help="Random seed for deterministic mock data + init (default: 42).",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help=(
+            "Train on placeholder mock datasets (random images, no cache) instead "
+            "of the real corpus. Useful for smoke tests without a precomputed "
+            "embedding cache."
+        ),
     )
     parser.add_argument(
         "--gnn-version",
@@ -167,17 +187,60 @@ def load_config(config_path: Path | None, batch_size_override: int | None) -> Se
     return Settings(**overrides)
 
 
-def build_datasets() -> tuple[
-    tuple[SatireDataset, SatireDataset, SatireDataset], SatireDataset
-]:
-    """Return (train_tiers, val_dataset).
+def build_datasets(mock: bool, config: Settings) -> dict[str, Any]:
+    """Build the training datasets, returning a bundle dict.
 
-    The data pipeline is still on placeholder mock datasets. When real
-    datasets land, this is the function to swap.
+    Keys: ``train_tiers`` (tuple of 3), ``val``, ``test`` (None for mock),
+    ``collate_fn`` (None for mock), and ``class_weights`` (None for mock).
+
+    ``mock=True`` keeps the placeholder path (random images) so tests and quick
+    smoke runs need no cache. Otherwise the real corpus is loaded from the
+    manifest, filtered to image-bearing items that have a precomputed embedding
+    cache, split stratified (persisted for stability), and all three curriculum
+    tiers point at the real train split — tier2/tier3 datasets don't exist yet,
+    which CurriculumDataLoader tolerates because every tier is the same non-empty
+    dataset.
     """
-    tier1, tier2, tier3 = create_mock_datasets()
-    val = create_mock_datasets()[0]
-    return (tier1, tier2, tier3), val
+    if mock:
+        tier1, tier2, tier3 = create_mock_datasets()
+        val = create_mock_datasets()[0]
+        return {
+            "train_tiers": (tier1, tier2, tier3),
+            "val": val,
+            "test": None,
+            "collate_fn": None,
+            "class_weights": None,
+        }
+
+    cache_dir = DEFAULT_EMBEDDING_DIR
+    items = load_corpus_items(allowed_labels=set(range(config.num_classes)))
+    items = [it for it in items if (cache_dir / f"{it.item_id}.pt").is_file()]
+    if not items:
+        raise RuntimeError(
+            f"no cached embeddings found under {cache_dir}; "
+            "run scripts/precompute_embeddings.py first"
+        )
+    assignments = assign_splits(items)
+    print_split_summary(items, assignments)
+    parts = split_items(items, assignments)
+
+    train_tiers = tuple(
+        CorpusEmbeddingDataset(parts["train"], cache_dir) for _ in range(3)
+    )
+    val_ds = CorpusEmbeddingDataset(parts["val"], cache_dir)
+    test_ds = CorpusEmbeddingDataset(parts["test"], cache_dir)
+
+    train_counts = Counter(it.label for it in parts["train"])
+    class_weights = class_weights_from_counts(
+        train_counts, config.num_classes, scheme=config.class_weight_scheme
+    )
+    return {
+        "train_tiers": train_tiers,
+        "val": val_ds,
+        "test": test_ds,
+        "collate_fn": collate_embeddings,
+        "class_weights": class_weights,
+    }
 
 
 def force_phase(trainer: SatireTrainer, phase: int) -> None:
@@ -358,9 +421,12 @@ def main(argv: list[str] | None = None) -> int:
             config.learning_rate,
         )
 
-        train_tiers, val_dataset = build_datasets()
+        bundle = build_datasets(mock=args.mock, config=config)
+        train_tiers = bundle["train_tiers"]
+        val_dataset = bundle["val"]
         logger.info(
-            "datasets: tier1=%d tier2=%d tier3=%d val=%d",
+            "datasets: mock=%s tier1=%d tier2=%d tier3=%d val=%d",
+            args.mock,
             len(train_tiers[0]),
             len(train_tiers[1]),
             len(train_tiers[2]),
@@ -377,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
             train_datasets=train_tiers,
             val_dataset=val_dataset,
             device=str(device),
+            class_weights=bundle["class_weights"],
+            collate_fn=bundle["collate_fn"],
         )
 
         if args.checkpoint is not None:

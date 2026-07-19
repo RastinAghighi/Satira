@@ -1,9 +1,10 @@
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 
 from satira.config import Settings
 from satira.data.datasets import CurriculumDataLoader, SatireDataset
@@ -35,9 +36,11 @@ class SatireTrainer:
         self,
         model: SatireDetectionEngine,
         config: Settings,
-        train_datasets: tuple[SatireDataset, SatireDataset, SatireDataset],
-        val_dataset: SatireDataset,
+        train_datasets: tuple[Dataset, Dataset, Dataset],
+        val_dataset: Dataset,
         device: str = "cuda",
+        class_weights: Optional[torch.Tensor] = None,
+        collate_fn: Optional[Callable[[list[dict]], dict]] = None,
     ) -> None:
         if len(train_datasets) != 3:
             raise ValueError(
@@ -51,16 +54,29 @@ class SatireTrainer:
         self.scheduler = CurriculumScheduler(total_epochs=25)
         self.phase_controller = PhaseTransitionController(patience=self.LOSS_PLATEAU_PATIENCE)
 
+        # A collate_fn switches the trainer onto the real cached-embedding path:
+        # batches carry precomputed vision/text tensors, a text padding mask, and
+        # temporal/graph presence flags instead of placeholder images.
+        self.collate_fn = collate_fn
         self.data_loader = CurriculumDataLoader(
             tier1=train_datasets[0],
             tier2=train_datasets[1],
             tier3=train_datasets[2],
             scheduler=self.scheduler,
             batch_size=config.batch_size,
+            collate_fn=collate_fn,
         )
         self.val_dataset = val_dataset
 
-        class_weights = torch.ones(config.num_classes)
+        if class_weights is None:
+            class_weights = torch.ones(config.num_classes)
+        else:
+            class_weights = class_weights.detach().clone().float()
+            if class_weights.numel() != config.num_classes:
+                raise ValueError(
+                    f"class_weights has {class_weights.numel()} entries but "
+                    f"num_classes={config.num_classes}"
+                )
         self.loss_fn = PhasedLossFunction(
             class_gate_targets=config.CLASS_GATE_TARGETS,
             class_weights=class_weights,
@@ -109,6 +125,35 @@ class SatireTrainer:
         graph = torch.randn(batch_size, cfg.graph_dim, device=self.device)
         return v, t, temp, graph
 
+    def _engine_inputs_from_batch(
+        self, batch: dict, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict, Optional[torch.Tensor]]:
+        """Return ``(v, t, temp, graph, forward_kwargs, text_mask)`` for the engine.
+
+        Real path (cached-embedding batch): route the precomputed vision/text
+        tensors, the text padding mask, and the cold-start presence flags. Temporal
+        and graph context is absent for every item, so zero placeholders go through
+        the projections and are deterministically replaced by the learned fallback
+        inside the engine.
+
+        Synthetic path (mock datasets): fabricate the four streams as before, with
+        no masks or presence flags.
+        """
+        if self.collate_fn is not None and "vision" in batch:
+            v = batch["vision"].to(self.device)
+            t = batch["text"].to(self.device)
+            temp = torch.zeros(batch_size, self.config.temporal_dim, device=self.device)
+            graph = torch.zeros(batch_size, self.config.graph_dim, device=self.device)
+            text_mask = batch["text_key_padding_mask"].to(self.device)
+            forward_kwargs = {
+                "text_key_padding_mask": text_mask,
+                "temporal_present": batch["temporal_present"].to(self.device),
+                "graph_present": batch["graph_present"].to(self.device),
+            }
+            return v, t, temp, graph, forward_kwargs, text_mask
+        v, t, temp, graph = self._synthesize_engine_inputs(batch_size)
+        return v, t, temp, graph, {}, None
+
     def _coerce_label_tensor(self, batch: dict) -> torch.Tensor:
         labels = batch["label"]
         if isinstance(labels, torch.Tensor):
@@ -144,14 +189,24 @@ class SatireTrainer:
         targets = self._coerce_label_tensor(batch)
         batch_size = targets.size(0)
 
-        v, t, temp, graph = self._synthesize_engine_inputs(batch_size)
+        v, t, temp, graph, forward_kwargs, text_mask = self._engine_inputs_from_batch(
+            batch, batch_size
+        )
 
-        logits, _t2v, _v2t, t_gate, v_gate = self.model(v, t, temp, graph)
+        logits, _t2v, _v2t, t_gate, v_gate = self.model(v, t, temp, graph, **forward_kwargs)
 
         logits_alt: Optional[torch.Tensor] = None
         if phase == 3:
-            v2, t2, temp2, graph2 = self._synthesize_engine_inputs(batch_size)
-            logits_alt, *_ = self.model(v2, t2, temp2, graph2)
+            # Second forward for the temporal-consistency term. The real
+            # cold-start path has no alternate graph snapshot, so it re-runs the
+            # same inputs; reasoning/classifier dropout makes the two passes
+            # differ, turning the term into a dropout-consistency regularizer. The
+            # synthetic path draws a fresh random snapshot, as before.
+            if forward_kwargs:
+                logits_alt, *_ = self.model(v, t, temp, graph, **forward_kwargs)
+            else:
+                v2, t2, temp2, graph2 = self._synthesize_engine_inputs(batch_size)
+                logits_alt, *_ = self.model(v2, t2, temp2, graph2)
 
         loss = self.loss_fn.compute(
             phase=phase,
@@ -160,6 +215,7 @@ class SatireTrainer:
             t_gate=t_gate,
             v_gate=v_gate,
             logits_alt_snapshot=logits_alt,
+            text_mask=text_mask,
         )
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -198,22 +254,52 @@ class SatireTrainer:
             "epoch": epoch,
         }
 
+    def _forward_dataset(self, dataset) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward every item of a cached-embedding dataset in batches.
+
+        Returns ``(logits, targets)`` over the whole dataset. Call inside a
+        ``torch.no_grad()`` context.
+        """
+        all_logits: list[torch.Tensor] = []
+        all_targets: list[torch.Tensor] = []
+        batch_size = self.config.batch_size
+        for start in range(0, len(dataset), batch_size):
+            samples = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
+            batch = self.collate_fn(samples)
+            targets = self._coerce_label_tensor(batch)
+            v, t, temp, graph, forward_kwargs, _ = self._engine_inputs_from_batch(
+                batch, targets.size(0)
+            )
+            logits, *_ = self.model(v, t, temp, graph, **forward_kwargs)
+            all_logits.append(logits)
+            all_targets.append(targets)
+        return torch.cat(all_logits, dim=0), torch.cat(all_targets, dim=0)
+
     def validate(self) -> dict:
         self.model.eval()
         ds = self.val_dataset
+        num_classes = self.config.num_classes
         if len(ds) == 0:
-            return {"loss": float("inf"), "accuracy": 0.0, "calibration_error": 0.0}
-
-        batch_size = min(self.config.batch_size, len(ds))
-        indices = list(range(batch_size))
-        targets = self._coerce_label_tensor(
-            {"label": [ds[i]["label"] for i in indices]}
-        )
-
-        v, t, temp, graph = self._synthesize_engine_inputs(batch_size)
+            return {
+                "loss": float("inf"),
+                "accuracy": 0.0,
+                "calibration_error": 0.0,
+                "f1_per_class": [0.0] * num_classes,
+            }
 
         with torch.no_grad():
-            logits, *_ = self.model(v, t, temp, graph)
+            if self.collate_fn is not None:
+                # Real path: score the entire held-out val split.
+                logits, targets = self._forward_dataset(ds)
+            else:
+                # Synthetic path: a single batch of placeholder inputs.
+                batch_size = min(self.config.batch_size, len(ds))
+                targets = self._coerce_label_tensor(
+                    {"label": [ds[i]["label"] for i in range(batch_size)]}
+                )
+                v, t, temp, graph = self._synthesize_engine_inputs(batch_size)
+                logits, *_ = self.model(v, t, temp, graph)
+
             loss = F.cross_entropy(logits, targets)
             preds = logits.argmax(dim=-1)
             accuracy = (preds == targets).float().mean().item()
@@ -223,7 +309,6 @@ class SatireTrainer:
             correct = (preds == targets).float()
             calibration_error = (confidence - correct).abs().mean().item()
 
-            num_classes = self.config.num_classes
             f1_per_class = []
             for c in range(num_classes):
                 tp = ((preds == c) & (targets == c)).sum().item()

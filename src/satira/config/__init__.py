@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     focal_gamma: float = 2.0
     gate_loss_weight: float = 0.3
     consistency_loss_weight: float = 0.1
+    # Loss class weighting: "uniform" (default) or "inverse_frequency", derived
+    # from the training-split counts with an epsilon-floored denominator.
+    class_weight_scheme: str = "uniform"
     temporal_drop_prob: float = 0.15
     graph_drop_prob: float = 0.15
     joint_drop_prob: float = 0.05
