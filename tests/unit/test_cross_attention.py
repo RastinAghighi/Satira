@@ -52,6 +52,29 @@ def test_handles_different_seq_lengths() -> None:
     assert v_gate.shape == (2, 20, 48)
 
 
+def test_text_key_padding_mask_excludes_padded_text_keys() -> None:
+    """vision_to_text must ignore padded text tokens where they act as keys:
+    v_out / v_gate are invariant to whatever occupies the masked positions, and
+    the masked key columns receive zero attention weight."""
+    torch.manual_seed(0)
+    module = ContrastiveCrossAttention(d_model=32, num_heads=4).eval()
+    v = torch.randn(2, 7, 32)
+    t = torch.randn(2, 6, 32)
+    mask = torch.zeros(2, 6, dtype=torch.bool)
+    mask[:, 4:] = True  # last two text tokens are padding
+
+    with torch.no_grad():
+        _, v_out1, _, v2t1, _, v_gate1 = module(v, t, text_key_padding_mask=mask)
+        t_scribbled = t.clone()
+        t_scribbled[:, 4:] = torch.randn(2, 2, 32) * 50
+        _, v_out2, _, v2t2, _, v_gate2 = module(v, t_scribbled, text_key_padding_mask=mask)
+
+    assert torch.allclose(v_out1, v_out2, atol=1e-5)
+    assert torch.allclose(v_gate1, v_gate2, atol=1e-5)
+    # Masked key columns get zero attention weight.
+    assert torch.allclose(v2t1[:, :, 4:], torch.zeros_like(v2t1[:, :, 4:]), atol=1e-6)
+
+
 def test_no_contradiction_yields_zero_delta() -> None:
     """When v_emb == t_emb and attention is identity, deltas vanish.
 

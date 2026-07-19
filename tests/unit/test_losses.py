@@ -4,8 +4,10 @@ import torch.nn.functional as F
 
 from satira.training.losses import (
     PhasedLossFunction,
+    class_weights_from_counts,
     contradiction_gate_loss,
     focal_loss,
+    per_sample_gate_activation,
     temporal_consistency_loss,
 )
 
@@ -203,6 +205,45 @@ def test_temporal_consistency_loss_scales_with_lambda() -> None:
     scaled = temporal_consistency_loss(a, b, lambda_consistency=1.0)
 
     assert torch.allclose(scaled, base * 10.0, atol=1e-5)
+
+
+def test_class_weights_uniform_is_the_default() -> None:
+    weights = class_weights_from_counts({0: 100, 1: 5}, 2)
+    assert torch.allclose(weights, torch.ones(2))
+
+
+def test_class_weights_inverse_frequency_upweights_rare_class_mean_one() -> None:
+    weights = class_weights_from_counts({0: 90, 1: 10}, 2, scheme="inverse_frequency")
+    assert weights[1] > weights[0]
+    assert torch.isclose(weights.mean(), torch.tensor(1.0), atol=1e-5)
+
+
+def test_class_weights_zero_count_class_stays_finite() -> None:
+    # Class 1 has no training examples; the eps floor must prevent a divide-by-zero.
+    weights = class_weights_from_counts({0: 100}, 2, scheme="inverse_frequency")
+    assert torch.isfinite(weights).all()
+    assert weights[1] > weights[0]
+
+
+def test_class_weights_rejects_unknown_scheme() -> None:
+    with pytest.raises(ValueError):
+        class_weights_from_counts({0: 1}, 2, scheme="bogus")
+
+
+def test_per_sample_gate_activation_ignores_padded_text() -> None:
+    # Two samples; sample 0 has 2 real text tokens then padding whose gate value
+    # is extreme. Masking must keep the padded positions out of the mean.
+    t_gate = torch.zeros(2, 4, 3)
+    t_gate[0, :2] = 0.5
+    t_gate[0, 2:] = 1.0  # "padding" region
+    t_gate[1, :] = 0.5
+    v_gate = torch.full((2, 5, 3), 0.5)
+    mask = torch.zeros(2, 4, dtype=torch.bool)
+    mask[0, 2:] = True  # sample 0's last two text tokens are padding
+
+    activation = per_sample_gate_activation(t_gate, v_gate, mask)
+    # Sample 0: t_mean over the 2 valid tokens = 0.5, v_mean = 0.5 -> 0.5.
+    assert torch.allclose(activation, torch.tensor([0.5, 0.5]), atol=1e-6)
 
 
 def _make_phased_loss() -> PhasedLossFunction:

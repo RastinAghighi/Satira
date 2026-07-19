@@ -50,6 +50,47 @@ def test_fallback_embeddings_are_learnable() -> None:
     assert isinstance(module.graph_fallback, torch.nn.Parameter)
 
 
+def test_substitute_absent_replaces_only_flagged_rows() -> None:
+    module = StructuredModalityDropout(d_model=8)
+    batch = 5
+    temp = torch.randn(batch, 8)
+    graph = torch.randn(batch, 8)
+    present = torch.tensor([True, False, True, False, False])
+
+    out_t, out_g = module.substitute_absent(temp.clone(), graph.clone(), present, present)
+    fb_t = module.temporal_fallback.view(-1)
+    fb_g = module.graph_fallback.view(-1)
+    for i, is_present in enumerate(present.tolist()):
+        if is_present:
+            assert torch.allclose(out_t[i], temp[i])
+            assert torch.allclose(out_g[i], graph[i])
+        else:
+            assert torch.allclose(out_t[i], fb_t)
+            assert torch.allclose(out_g[i], fb_g)
+
+
+def test_substitute_absent_applies_in_eval_mode() -> None:
+    module = StructuredModalityDropout(d_model=8)
+    module.eval()  # stochastic forward is a pass-through in eval; substitution is not
+    batch = 3
+    temp = torch.randn(batch, 8)
+    graph = torch.randn(batch, 8)
+    absent = torch.zeros(batch, dtype=torch.bool)
+
+    out_t, out_g = module.substitute_absent(temp, graph, absent, absent)
+    assert torch.allclose(out_t, module.temporal_fallback.view(1, -1).expand(batch, -1))
+    assert torch.allclose(out_g, module.graph_fallback.view(1, -1).expand(batch, -1))
+
+
+def test_substitute_absent_none_flag_is_noop() -> None:
+    module = StructuredModalityDropout(d_model=8)
+    temp = torch.randn(4, 8)
+    graph = torch.randn(4, 8)
+    out_t, out_g = module.substitute_absent(temp.clone(), graph.clone(), None, None)
+    assert torch.allclose(out_t, temp)
+    assert torch.allclose(out_g, graph)
+
+
 def test_batch_independence() -> None:
     torch.manual_seed(42)
     module = StructuredModalityDropout(

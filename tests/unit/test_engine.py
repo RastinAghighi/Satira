@@ -63,6 +63,57 @@ def test_output_shapes() -> None:
     assert torch.all((v_gate >= 0) & (v_gate <= 1))
 
 
+def test_text_padding_mask_makes_logits_invariant_to_padded_text() -> None:
+    """End-to-end: scribbling over padded text positions must not change the
+    logits when a matching text_key_padding_mask is supplied."""
+    torch.manual_seed(0)
+    engine = _make_engine().eval()
+    batch, vision_len, text_max = 3, 10, 12
+    v = torch.randn(batch, vision_len, 128)
+    t = torch.randn(batch, text_max, 96)
+    temp = torch.zeros(batch, 96)
+    graph = torch.zeros(batch, 48)
+    lengths = torch.tensor([4, 8, 12])
+    mask = torch.arange(text_max)[None, :] >= lengths[:, None]
+    absent = torch.zeros(batch, dtype=torch.bool)
+
+    with torch.no_grad():
+        logits1, *_ = engine(
+            v, t, temp, graph,
+            text_key_padding_mask=mask, temporal_present=absent, graph_present=absent,
+        )
+        t_scribbled = t.clone()
+        for i, length in enumerate(lengths.tolist()):
+            t_scribbled[i, length:] = torch.randn(text_max - length, 96) * 100
+        logits2, *_ = engine(
+            v, t_scribbled, temp, graph,
+            text_key_padding_mask=mask, temporal_present=absent, graph_present=absent,
+        )
+
+    assert torch.allclose(logits1, logits2, atol=1e-5)
+
+
+def test_absent_presence_flags_substitute_learned_fallback() -> None:
+    """With presence flags all-False, the temporal/graph streams become the
+    learned fallback in both train and eval mode."""
+    engine = _make_engine()
+    batch = 4
+    _, _, temp, graph = _make_inputs(batch=batch)
+    absent = torch.zeros(batch, dtype=torch.bool)
+
+    for mode in ("eval", "train"):
+        getattr(engine, mode)()
+        proj_t = engine.temp_proj(temp)
+        proj_g = engine.graph_proj(graph)
+        out_t, out_g = engine.modality_dropout.substitute_absent(
+            proj_t, proj_g, absent, absent
+        )
+        fb_t = engine.modality_dropout.temporal_fallback.view(1, -1).expand(batch, -1)
+        fb_g = engine.modality_dropout.graph_fallback.view(1, -1).expand(batch, -1)
+        assert torch.allclose(out_t, fb_t)
+        assert torch.allclose(out_g, fb_g)
+
+
 def test_freeze_for_phase_1_freezes_fusion() -> None:
     engine = _make_engine()
     engine.freeze_for_phase(1)
