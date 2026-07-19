@@ -91,6 +91,7 @@ from satira.ingest import (  # noqa: E402
 )
 from satira.ingest.huggingface_loader import KNOWN_SATIRE_DATASETS  # noqa: E402
 from satira.ingest.source_credibility import NEWS, SATIRE  # noqa: E402
+from satira.labels import BINARY_STR_TO_INT, int_to_str  # noqa: E402
 
 
 logger = logging.getLogger("satira.build_tier1")
@@ -157,10 +158,13 @@ _NSFW_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-LABEL_AUTHENTIC = 0
-LABEL_SATIRE = 1
-_STR_TO_LABEL = {"authentic": LABEL_AUTHENTIC, "satire": LABEL_SATIRE}
-_LABEL_NAMES = {LABEL_AUTHENTIC: "authentic", LABEL_SATIRE: "satire"}
+# Tier 1 is a binary authentic/satire slice; labels come from the canonical
+# taxonomy (satira.labels) so there is a single source of truth. ``.get()`` on
+# _STR_TO_LABEL returns None for any non-binary label, which verify_labels drops.
+LABEL_AUTHENTIC = BINARY_STR_TO_INT["authentic"]
+LABEL_SATIRE = BINARY_STR_TO_INT["satire"]
+_STR_TO_LABEL = BINARY_STR_TO_INT
+_LABEL_NAMES = {index: int_to_str(index) for index in BINARY_STR_TO_INT.values()}
 
 _DOWNLOAD_BATCH = 50
 _MAX_CONCURRENT_DOWNLOADS = 10

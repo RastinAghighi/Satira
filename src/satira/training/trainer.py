@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from satira.config import Settings
 from satira.data.datasets import CurriculumDataLoader, SatireDataset
+from satira.labels import str_to_int as label_str_to_int
 from satira.models.engine import SatireDetectionEngine
 from satira.training.curriculum import CurriculumScheduler, PhaseTransitionController
 from satira.training.losses import PhasedLossFunction
@@ -112,14 +113,16 @@ class SatireTrainer:
         labels = batch["label"]
         if isinstance(labels, torch.Tensor):
             return labels.to(self.device, dtype=torch.long)
-        coerced = []
+        coerced: list[int] = []
         for lbl in labels:
             if isinstance(lbl, torch.Tensor):
-                coerced.append(int(lbl))
+                coerced.append(int(lbl.item()))
             elif isinstance(lbl, (int, bool)):
                 coerced.append(int(lbl))
             elif isinstance(lbl, str):
-                coerced.append(0)
+                # Canonical mapping; raises ValueError on an unknown string
+                # rather than silently bucketing it into class 0.
+                coerced.append(label_str_to_int(lbl))
             else:
                 coerced.append(int(lbl))
         return torch.tensor(coerced, dtype=torch.long, device=self.device)

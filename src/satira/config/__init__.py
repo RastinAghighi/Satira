@@ -1,5 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from satira.labels import class_names
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -11,7 +13,7 @@ class Settings(BaseSettings):
     # Model config
     d_model: int = 512
     num_heads: int = 8
-    num_classes: int = 5
+    num_classes: int = 4
     vision_dim: int = 1024
     text_dim: int = 768
     temporal_dim: int = 768
@@ -38,15 +40,13 @@ class Settings(BaseSettings):
     max_batch_size: int = 32
     batch_timeout_ms: float = 50.0
 
-    # Class gate targets
-    CLASS_GATE_TARGETS: dict = {0: 0.1, 1: 0.9, 2: 0.8, 3: 0.2, 4: 0.4}
-    CLASS_NAMES: list = [
-        "authentic",
-        "satire",
-        "parody",
-        "misleading_context",
-        "fabricated",
-    ]
+    # Per-class contradiction-gate targets, keyed by the canonical class index
+    # (see satira.labels). authentic closes its gates (0.1); satire keeps them
+    # open (0.9); the misinformation classes sit in between.
+    CLASS_GATE_TARGETS: dict = {0: 0.1, 1: 0.9, 2: 0.2, 3: 0.4}
+    # Canonical class names, sourced from satira.labels so there is one
+    # authoritative taxonomy. Kept length-consistent with num_classes.
+    CLASS_NAMES: list = class_names()
 
 
 settings = Settings()
