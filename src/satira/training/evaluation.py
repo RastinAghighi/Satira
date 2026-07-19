@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from satira.config import Settings
 from satira.models.engine import SatireDetectionEngine
+from satira.training.losses import per_sample_gate_activation
 
 
 @dataclass
@@ -115,10 +116,12 @@ class ModelEvaluator:
 
         all_logits: list[torch.Tensor] = []
         all_targets: list[torch.Tensor] = []
-        all_t_gates: list[torch.Tensor] = []
-        all_v_gates: list[torch.Tensor] = []
+        all_gate_scalars: list[torch.Tensor] = []
         all_t2v: list[torch.Tensor] = []
         all_v2t: list[torch.Tensor] = []
+
+        def _to_device(value):
+            return value.to(self.device) if isinstance(value, torch.Tensor) else value
 
         with torch.no_grad():
             for batch in dataloader:
@@ -127,13 +130,28 @@ class ModelEvaluator:
                 temp = batch["temporal_ctx"].to(self.device)
                 graph = batch["graph_ctx"].to(self.device)
                 targets = batch["label"].to(self.device, dtype=torch.long)
+                # Optional real-data extras; absent for the synthetic path.
+                text_mask = _to_device(batch.get("text_key_padding_mask"))
+                temporal_present = _to_device(batch.get("temporal_present"))
+                graph_present = _to_device(batch.get("graph_present"))
 
-                logits, t2v_w, v2t_w, t_gate, v_gate = self.model(v, t, temp, graph)
+                logits, t2v_w, v2t_w, t_gate, v_gate = self.model(
+                    v,
+                    t,
+                    temp,
+                    graph,
+                    text_key_padding_mask=text_mask,
+                    temporal_present=temporal_present,
+                    graph_present=graph_present,
+                )
+
+                # Per-sample gate activation, masked so padded text tokens don't
+                # dilute it; aggregated per class below.
+                gate_scalar = per_sample_gate_activation(t_gate, v_gate, text_mask)
 
                 all_logits.append(logits.detach().cpu())
                 all_targets.append(targets.detach().cpu())
-                all_t_gates.append(t_gate.detach().cpu())
-                all_v_gates.append(v_gate.detach().cpu())
+                all_gate_scalars.append(gate_scalar.detach().cpu())
                 all_t2v.append(t2v_w.detach().cpu())
                 all_v2t.append(v2t_w.detach().cpu())
 
@@ -151,8 +169,7 @@ class ModelEvaluator:
 
         logits = torch.cat(all_logits, dim=0)
         targets = torch.cat(all_targets, dim=0)
-        t_gates = torch.cat(all_t_gates, dim=0)
-        v_gates = torch.cat(all_v_gates, dim=0)
+        gate_scalars = torch.cat(all_gate_scalars, dim=0)
         t2v_weights = torch.cat(all_t2v, dim=0)
         v2t_weights = torch.cat(all_v2t, dim=0)
 
@@ -165,8 +182,9 @@ class ModelEvaluator:
         )
         ece = self.calibration_error(predictions=probs, targets=targets)
 
-        combined_gates = torch.cat([t_gates, v_gates], dim=1)
-        gates = self.gate_analysis(combined_gates, targets)
+        # gate_scalars is one activation per sample; gate_analysis reduces the
+        # trailing dim, so a (N, 1) view yields the per-class mean directly.
+        gates = self.gate_analysis(gate_scalars.unsqueeze(1), targets)
 
         attention = {
             "t2v": self.attention_entropy(t2v_weights),

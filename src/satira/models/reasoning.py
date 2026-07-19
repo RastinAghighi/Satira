@@ -41,6 +41,7 @@ class ContextualReasoningBlock(nn.Module):
         grounded_vision: torch.Tensor,
         temp_emb: torch.Tensor,
         graph_emb: torch.Tensor,
+        text_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = grounded_text.size(0)
 
@@ -68,5 +69,39 @@ class ContextualReasoningBlock(nn.Module):
         type_emb = self.type_embeddings(type_ids).unsqueeze(0)
         seq = seq + type_emb
 
-        out = self.encoder(seq)
+        src_key_padding_mask = self._build_src_mask(
+            text_key_padding_mask,
+            batch_size=batch_size,
+            prefix_len=1 + temp_emb.size(1) + graph_emb.size(1),
+            text_len=text_len,
+            vision_len=vision_len,
+            device=seq.device,
+        )
+
+        out = self.encoder(seq, src_key_padding_mask=src_key_padding_mask)
         return out[:, 0]
+
+    @staticmethod
+    def _build_src_mask(
+        text_key_padding_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        prefix_len: int,
+        text_len: int,
+        vision_len: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Expand a text-only padding mask to cover the full fused sequence.
+
+        The sequence is ``[cls, temporal, graph, text..., vision...]``. Only the
+        text span can carry padding, so the CLS/temporal/graph prefix and the
+        (fixed-length) vision span are always attendable; the supplied
+        ``(batch, text_len)`` mask fills the text span. Returns ``None`` when no
+        mask is given, which keeps the unmasked path byte-for-byte unchanged.
+        """
+        if text_key_padding_mask is None:
+            return None
+        mask = text_key_padding_mask.to(device=device, dtype=torch.bool)
+        prefix = torch.zeros(batch_size, prefix_len, dtype=torch.bool, device=device)
+        vision = torch.zeros(batch_size, vision_len, dtype=torch.bool, device=device)
+        return torch.cat([prefix, mask, vision], dim=1)

@@ -29,6 +29,48 @@ class StructuredModalityDropout(nn.Module):
         self.temporal_fallback = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.graph_fallback = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
+    @staticmethod
+    def _apply_presence(
+        emb: torch.Tensor,
+        fallback: torch.Tensor,
+        present: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Replace batch rows whose ``present`` flag is False with ``fallback``.
+
+        ``present`` is a boolean tensor of shape ``(batch,)`` (True = the real
+        context is present for that item). ``fallback`` is the learned
+        ``(1, 1, d_model)`` embedding. Broadcasting handles both 2-D
+        ``(batch, d_model)`` and 3-D ``(batch, 1, d_model)`` inputs.
+        """
+        if present is None:
+            return emb
+        batch_size = emb.size(0)
+        present = present.to(device=emb.device, dtype=torch.bool)
+        keep = present.view(batch_size, *([1] * (emb.dim() - 1)))
+        fb = fallback.view(*([1] * (emb.dim() - 1)), -1).expand_as(emb)
+        return torch.where(keep, emb, fb)
+
+    def substitute_absent(
+        self,
+        temp_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        temporal_present: torch.Tensor | None,
+        graph_present: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Deterministically swap absent context streams for the learned fallback.
+
+        Unlike :meth:`forward` — which drops streams *stochastically* and only in
+        training mode to simulate random production cache misses — this applies
+        in BOTH train and eval, driven entirely by the presence flags. It is the
+        cold-start path: an item with no temporal/graph context available uses
+        the same learned default the stochastic dropout trains against, so the
+        two paths stay consistent. Passing ``None`` for a flag leaves that stream
+        untouched.
+        """
+        temp_out = self._apply_presence(temp_emb, self.temporal_fallback, temporal_present)
+        graph_out = self._apply_presence(graph_emb, self.graph_fallback, graph_present)
+        return temp_out, graph_out
+
     def forward(
         self,
         temp_emb: torch.Tensor,

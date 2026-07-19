@@ -33,6 +33,31 @@ def focal_loss(
     return loss.mean()
 
 
+def per_sample_gate_activation(
+    t_gate: torch.Tensor,
+    v_gate: torch.Tensor,
+    text_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean contradiction-gate activation per sample: ``0.5 * (t_mean + v_mean)``.
+
+    ``t_gate`` is ``(batch, text_len, d)`` and ``v_gate`` is ``(batch, vision_len, d)``.
+    When ``text_mask`` (``(batch, text_len)``, True == padding) is given, the text
+    mean is taken only over valid tokens so zero-padded positions don't dilute the
+    signal. Vision is fixed-length and unpadded, so its mean is always over all
+    tokens. Returns a ``(batch,)`` tensor.
+    """
+    batch_size = t_gate.size(0)
+    if text_mask is None:
+        t_mean = t_gate.reshape(batch_size, -1).mean(dim=-1)
+    else:
+        valid = (~text_mask.to(torch.bool)).to(t_gate.dtype)  # (batch, text_len)
+        weighted = (t_gate * valid.unsqueeze(-1)).sum(dim=(1, 2))
+        denom = valid.sum(dim=1).clamp_min(1.0) * t_gate.size(-1)
+        t_mean = weighted / denom
+    v_mean = v_gate.reshape(batch_size, -1).mean(dim=-1)
+    return 0.5 * (t_mean + v_mean)
+
+
 def _build_class_gate_target_tensor(
     class_gate_targets: dict[int, float],
     device: torch.device,
@@ -51,25 +76,23 @@ def contradiction_gate_loss(
     v_gate: torch.Tensor,
     targets: torch.Tensor,
     class_gate_targets: dict[int, float],
+    text_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Supervised gate loss against class-specific gate targets.
 
     L1 sparsity pushes ALL gates toward zero regardless of whether contradiction
     exists. This supervised version trains gates against per-class targets so
-    that satire/parody samples (which need cross-modal contradiction signal)
-    keep their gates open while authentic samples close them.
+    that satire samples (which need cross-modal contradiction signal) keep their
+    gates open while authentic samples close them.
 
-    The mean activation per sample (averaged across all non-batch dims of t_gate
-    and v_gate jointly) is compared via BCE to the target for that sample's
-    class.
+    The mean activation per sample (see :func:`per_sample_gate_activation`, which
+    honours ``text_mask`` so padded text tokens don't dilute it) is compared via
+    BCE to the target for that sample's class.
     """
     if t_gate.size(0) != v_gate.size(0):
         raise ValueError("t_gate and v_gate must share the batch dimension")
 
-    batch_size = t_gate.size(0)
-    t_mean = t_gate.reshape(batch_size, -1).mean(dim=-1)
-    v_mean = v_gate.reshape(batch_size, -1).mean(dim=-1)
-    gate_mean = 0.5 * (t_mean + v_mean)
+    gate_mean = per_sample_gate_activation(t_gate, v_gate, text_mask)
 
     target_table = _build_class_gate_target_tensor(
         class_gate_targets, device=gate_mean.device, dtype=gate_mean.dtype
@@ -135,6 +158,7 @@ class PhasedLossFunction(nn.Module):
         t_gate: torch.Tensor | None = None,
         v_gate: torch.Tensor | None = None,
         logits_alt_snapshot: torch.Tensor | None = None,
+        text_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if phase == 1:
             return F.cross_entropy(logits, targets, weight=self.class_weights)
@@ -146,7 +170,7 @@ class PhasedLossFunction(nn.Module):
                 logits, targets, gamma=self.gamma, class_weights=self.class_weights
             )
             gate_loss = contradiction_gate_loss(
-                t_gate, v_gate, targets, self.class_gate_targets
+                t_gate, v_gate, targets, self.class_gate_targets, text_mask=text_mask
             )
             return cls_loss + self.gate_loss_weight * gate_loss
 
@@ -159,7 +183,7 @@ class PhasedLossFunction(nn.Module):
                 logits, targets, gamma=self.gamma, class_weights=self.class_weights
             )
             gate_loss = contradiction_gate_loss(
-                t_gate, v_gate, targets, self.class_gate_targets
+                t_gate, v_gate, targets, self.class_gate_targets, text_mask=text_mask
             )
             consistency = temporal_consistency_loss(
                 logits, logits_alt_snapshot, lambda_consistency=self.lambda_consistency

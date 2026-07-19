@@ -32,6 +32,7 @@ class ContrastiveCrossAttention(nn.Module):
         self,
         v_emb: torch.Tensor,
         t_emb: torch.Tensor,
+        text_key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -40,11 +41,20 @@ class ContrastiveCrossAttention(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        # ``text_key_padding_mask`` (batch, text_len), True == padding, masks the
+        # text tokens where they act as attention *keys*. That is only in
+        # vision_to_text (text is key/value); in text_to_vision text is the query
+        # and vision — fixed-length, unpadded — is the key, so no mask is needed
+        # there. Vision has no padding.
         t_grounded, t2v_weights = self.text_to_vision(
             query=t_emb, key=v_emb, value=v_emb, need_weights=True
         )
         v_grounded, v2t_weights = self.vision_to_text(
-            query=v_emb, key=t_emb, value=t_emb, need_weights=True
+            query=v_emb,
+            key=t_emb,
+            value=t_emb,
+            key_padding_mask=text_key_padding_mask,
+            need_weights=True,
         )
 
         t_delta = t_emb - t_grounded

@@ -55,6 +55,10 @@ class SatireDetectionEngine(nn.Module):
         t_tokens: torch.Tensor,
         temporal_ctx: torch.Tensor,
         graph_ctx: torch.Tensor,
+        *,
+        text_key_padding_mask: torch.Tensor | None = None,
+        temporal_present: torch.Tensor | None = None,
+        graph_present: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         v_emb = self.v_proj(v_patches)
         t_emb = self.t_proj(t_tokens)
@@ -62,12 +66,27 @@ class SatireDetectionEngine(nn.Module):
         graph_emb = self.graph_proj(graph_ctx)
 
         t_out, v_out, t2v_weights, v2t_weights, t_gate, v_gate = self.cross_attn(
-            v_emb, t_emb
+            v_emb, t_emb, text_key_padding_mask=text_key_padding_mask
         )
 
+        # Deterministic cold-start substitution (both train and eval): streams
+        # flagged absent take the learned fallback. The stochastic dropout then
+        # still fires during training to simulate random cache misses on the
+        # streams that are present. When the presence flags are None (the legacy
+        # synthetic path) substitution is a no-op and only the stochastic dropout
+        # applies, exactly as before.
+        temp_emb, graph_emb = self.modality_dropout.substitute_absent(
+            temp_emb, graph_emb, temporal_present, graph_present
+        )
         temp_emb, graph_emb = self.modality_dropout(temp_emb, graph_emb)
 
-        cls_embedding = self.reasoning(t_out, v_out, temp_emb, graph_emb)
+        cls_embedding = self.reasoning(
+            t_out,
+            v_out,
+            temp_emb,
+            graph_emb,
+            text_key_padding_mask=text_key_padding_mask,
+        )
 
         logits = self.classifier(cls_embedding)
 
