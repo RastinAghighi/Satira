@@ -1,0 +1,20 @@
+{
+  "run_date": "2026-07-19T07:00:07.577006+00:00",
+  "items_scraped": 189,
+  "items_new": 110,
+  "items_duplicate": 79,
+  "images_downloaded": 83,
+  "by_source": {
+    "nytimes.com": 20,
+    "babylonbee.com": 3,
+    "bbc.co.uk": 27,
+    "npr.org": 10,
+    "theguardian.com": 25,
+    "aljazeera.com": 25
+  },
+  "by_label": {
+    "authentic": 107,
+    "satire": 3
+  },
+  "errors": []
+}
